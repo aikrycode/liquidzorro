@@ -14,30 +14,34 @@ bridging Zorro's synchronous, single-threaded calls to that SDK's async
 ## Architecture
 
 ```
-Zorro.exe
-   |  synchronous C ABI calls: BrokerOpen / BrokerLogin / BrokerAsset /
-   |  BrokerBuy2 / BrokerTrade / BrokerSell2 / BrokerAccount / BrokerTime / ...
+Zorro64.exe
+   |  synchronous C ABI calls: BrokerOpen / BrokerLogin / BrokerTime /
+   |  BrokerAsset / BrokerHistory2 / BrokerCommand / BrokerBuy2 / BrokerTrade / ...
+   |  (there is no BrokerSell2 -- a negative Amount to BrokerBuy2 sells/closes)
    v
-liquidzorro.dll  (Rust cdylib)
-   +-- ffi      -- extern "C" exports matching trading.h exactly
+liquidzorro.dll  (Rust cdylib, in Zorro's Plugin64\ folder)
+   +-- ffi      -- extern "C" exports, verified against a real trading.h/Simulation.cpp
    +-- runtime  -- single Tokio runtime, owned for the DLL's lifetime
-   +-- bridge   -- sync -> async: blocking calls (orders, account info) use
-   |               runtime.block_on(...); streaming data (price/order
-   |               updates) is cached by a background task so polling calls
-   |               never block on a network round-trip
+   +-- bridge   -- sync -> async: each FFI call does a short runtime.block_on(...)
+   |               over a REST request today; streaming (WS) caching is a later
+   |               optimization once polling performance needs it
    +-- hyperliquid-rust-sdk (path dependency) -- InfoClient + ExchangeClient
-   +-- assets   -- Hyperliquid spot asset universe <-> Zorro asset list
-   +-- state    -- shared clients + live cache + trade-id mapping
+   +-- assets   -- (Phase 3) Hyperliquid spot asset universe <-> Zorro asset list
+   +-- state    -- logged-in clients + Zorro's message/progress callbacks
 ```
 
-## Source layout (Phase 1 scaffolding)
+## Source layout
 
 | File | Role |
 | --- | --- |
-| `Cargo.toml` | Declares the crate as a `cdylib` and pulls in `hyperliquid_rust_sdk` (path dependency on the sibling SDK checkout) and `tokio`. |
+| `Cargo.toml` | Declares the crate as a `cdylib`; depends on `hyperliquid_rust_sdk` (path dependency on the sibling SDK checkout), `alloy` (for `PrivateKeySigner`), and `tokio`. |
 | `src/lib.rs` | Crate root; wires up the module tree and re-exports the FFI surface. |
-| `src/ffi.rs` | The Zorro-facing C ABI exports (`BrokerOpen`, `BrokerLogin`, ...). Currently stub implementations reconstructed from the Zorro manual; signatures must be re-verified against the real `trading.h`/`variables.h` before Phase 2. |
+| `src/ffi.rs` | The Zorro-facing C ABI exports. `BrokerOpen`, `BrokerLogin`, `BrokerTime`, `BrokerAsset`, `BrokerHistory2` are implemented against Hyperliquid testnet; `BrokerBuy2`/`BrokerTrade`/`BrokerAccount` land in Phase 3. Signatures verified against a real Zorro S 2026 install's `trading.h` and `Simulation.cpp` sample plugin. |
+| `src/bridge.rs` | Sync-to-async bridge: owns the `login`/`asset_price`/`history` calls that block on the Tokio runtime to drive the async SDK, plus the OLE-date <-> Unix-time conversions Zorro's `DATE` type needs. |
+| `src/state.rs` | Shared plugin state: the logged-in `InfoClient`/`ExchangeClient`, and the `fpError`/`fpProgress` callback pointers captured in `BrokerOpen` (used to report messages back to Zorro instead of stdout). |
 | `src/runtime.rs` | Owns the single lazily-started Tokio runtime used to drive the async SDK from Zorro's blocking calls. |
-| `src/state.rs` | Shared plugin state: Hyperliquid clients, asset map, and trade-id tracking (populated starting Phase 2). |
-| `src/bridge.rs` | Placeholder for the sync<->async bridging logic between Zorro's blocking FFI calls and the SDK's async calls. |
-| `src/assets.rs` | Placeholder for mapping Hyperliquid's spot asset universe to Zorro's expected asset list format. |
+| `src/assets.rs` | Placeholder for Phase 3: mapping Hyperliquid's spot asset universe to Zorro's expected asset list format. |
+
+## Local setup
+
+Set `HL_TESTNET_PRIVKEY` to a Hyperliquid testnet private key before `BrokerLogin` can succeed; never commit it (see `.gitignore`'s `.env` entry).
