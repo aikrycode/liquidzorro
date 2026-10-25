@@ -33,6 +33,10 @@ pub struct T6 {
 const PLUGIN_NAME: &[u8] = b"Hyperliquid\0";
 const PLUGIN_VERSION: c_int = 2;
 
+/// trading.h's `#define NAY -999997` sentinel, used by `BrokerTrade` for
+/// "no value"/"not available" style returns.
+pub const NAY: i32 = -999_997;
+
 /// Reads a Zorro-supplied `char*` argument as a `&str`, returning `None` for
 /// a null pointer or invalid UTF-8.
 unsafe fn read_cstr<'a>(ptr: *const c_char) -> Option<&'a str> {
@@ -182,9 +186,90 @@ pub unsafe extern "C" fn BrokerHistory2(
     candles.len() as c_int
 }
 
-/// TODO(Phase 3): GET_COMPLIANCE/GET_MAXREQUESTS/GET_BROKERZONE/GET_MAXTICKS/
-/// SET_SYMBOL/SET_ORDERTYPE, extended once BrokerBuy2/BrokerTrade land and we
-/// can see what a live Zorro64 session actually requests.
+#[no_mangle]
+pub unsafe extern "C" fn BrokerAccount(
+    _account: *mut c_char,
+    p_balance: *mut f64,
+    p_trade_val: *mut f64,
+    p_margin_val: *mut f64,
+) -> c_int {
+    let Some((balance, trade_val, margin_val)) = bridge::account_balance() else {
+        return 0;
+    };
+    if !p_balance.is_null() {
+        *p_balance = balance;
+    }
+    if !p_trade_val.is_null() {
+        *p_trade_val = trade_val;
+    }
+    if !p_margin_val.is_null() {
+        *p_margin_val = margin_val;
+    }
+    1
+}
+
+/// Positive `Amount` buys, negative sells/closes -- Zorro's ABI has no
+/// separate "sell"/"close" export, so the sign of `Amount` is the only
+/// signal `BrokerBuy2` gets.
+#[no_mangle]
+pub unsafe extern "C" fn BrokerBuy2(
+    asset: *mut c_char,
+    amount: c_int,
+    stop_dist: f64,
+    limit: f64,
+    p_price: *mut f64,
+    p_fill: *mut c_int,
+) -> c_int {
+    let _ = stop_dist; // TODO(Phase 4): wire to a Hyperliquid trigger order
+    let Some(symbol) = read_cstr(asset) else {
+        return 0;
+    };
+    match bridge::place_order(symbol, amount, limit) {
+        Ok((zorro_id, price, fill)) => {
+            if !p_price.is_null() {
+                *p_price = price;
+            }
+            if !p_fill.is_null() {
+                *p_fill = fill;
+            }
+            zorro_id
+        }
+        Err(e) => {
+            state::log_error(&format!("BrokerBuy2 failed: {e}"));
+            0
+        }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn BrokerTrade(
+    trade_id: c_int,
+    p_open: *mut f64,
+    p_close: *mut f64,
+    p_cost: *mut f64,
+    p_profit: *mut f64,
+) -> c_int {
+    let Some((open, close, cost, profit, fill)) = bridge::trade_status(trade_id) else {
+        return NAY;
+    };
+    if !p_open.is_null() {
+        *p_open = open;
+    }
+    if !p_close.is_null() {
+        *p_close = close;
+    }
+    if !p_cost.is_null() {
+        *p_cost = cost;
+    }
+    if !p_profit.is_null() {
+        *p_profit = profit;
+    }
+    fill
+}
+
+/// TODO(Phase 4): GET_COMPLIANCE/GET_MAXREQUESTS/GET_BROKERZONE/GET_MAXTICKS/
+/// SET_SYMBOL/SET_ORDERTYPE, extended once we can see what a live Zorro64
+/// session actually requests.
 #[no_mangle]
 pub unsafe extern "C" fn BrokerCommand(_command: c_int, _parameter: isize) -> f64 {
     0.0
