@@ -5,6 +5,36 @@
 
 use super::*;
 
+/// One-off diagnostic: prints every spot pair Hyperliquid lists on whichever
+/// network `HL_TESTNET_PRIVKEY` points at, so a real pair name (e.g. for
+/// BTC) can be confirmed instead of guessed. Not a real test -- just run
+/// with `cargo test -- --ignored --nocapture bridge::tests::lists_spot_pairs`.
+#[test]
+#[ignore]
+fn lists_spot_pairs() {
+    login(None, BaseUrl::Testnet).expect("login should succeed");
+    let plugin = state::get().unwrap();
+    let spot_meta = runtime::get()
+        .block_on(plugin.info_client.spot_meta())
+        .expect("spot_meta should succeed");
+    let token_name = |idx: usize| {
+        spot_meta
+            .tokens
+            .iter()
+            .find(|t| t.index == idx)
+            .map(|t| t.name.as_str())
+            .unwrap_or("?")
+    };
+    for asset in &spot_meta.universe {
+        println!(
+            "{} (base={}, quote={})",
+            asset.name,
+            token_name(asset.tokens[0]),
+            token_name(asset.tokens[1])
+        );
+    }
+}
+
 /// `(pair_name, base_token_name)` for the first entry in `spot_meta()`'s
 /// universe, used as "some spot pair to test against" throughout -- on
 /// Hyperliquid testnet that's PURR/USDC with base token name "PURR".
@@ -104,13 +134,12 @@ fn places_and_closes_a_spot_order() {
 
     // Hyperliquid rejects orders below $10 notional; size up to just clear
     // that floor (with a small buffer for price movement) rather than
-    // hardcoding a unit count that could fall under it.
+    // hardcoding a unit count that could fall under it. `units` is in
+    // AMOUNT_SCALE sub-units, matching what BrokerBuy2's Amount expects.
     let price = asset_price(&pair).expect("price for sizing");
-    let units = ((11.0 / price).ceil() as i32).max(1);
-    println!(
-        "{pair} price {price}, buying {units} units (~{} USDC notional)",
-        units as f64 * price
-    );
+    let real_qty = (11.0 / price).ceil().max(1.0);
+    let units = (real_qty * AMOUNT_SCALE).round() as i32;
+    println!("{pair} price {price}, buying {real_qty} units (~{} USDC notional)", real_qty * price);
 
     let (trade_id, buy_price, buy_fill) =
         place_order(&pair, units, 0.0).expect("buy order should succeed");
