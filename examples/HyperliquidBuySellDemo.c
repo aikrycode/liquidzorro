@@ -13,23 +13,22 @@
 //   - Demo/Real toggle: Demo = testnet, Real = mainnet -- start with Demo
 //   - Run this script in [Trade] mode (it does nothing in [Test]/backtest)
 //
-// IMPORTANT: HL_BROKER_SYMBOL is verified against TESTNET's spot_meta() as of
-// writing (via src/bridge/tests.rs's lists_spot_pairs) -- Hyperliquid only
-// gives a friendly "TOKEN/USDC" name to a handful of "canonical" listings
-// (e.g. PURR/USDC); every other spot pair, BTC/USDC included, is only
-// addressable by its literal "@<index>" string. On testnet that's "@50".
-// This index is almost certainly DIFFERENT on mainnet (testnet is full of
-// junk test-token listings with unrelated sequential indices) -- re-run
-// lists_spot_pairs against mainnet (BaseUrl::Mainnet) before ever using
-// the Real toggle, and update this constant accordingly.
-#define HL_SYMBOL         "BTC/USD"    // script-facing asset name (your choice)
-#define HL_BROKER_SYMBOL  "@50"        // testnet BTC/USDC; re-verify for mainnet
-#define USD_AMOUNT        25           // how much to buy, in USDC notional
+// HL_SYMBOL must be a Name listed in History/AssetsHyperliquid.csv -- that
+// CSV maps it to the real Hyperliquid broker symbol (e.g. BTC/USD -> "@50"
+// on testnet, since Hyperliquid only gives a friendly "TOKEN/USDC" name to
+// a handful of "canonical" listings like PURR/USDC; everything else is only
+// addressable by its literal "@<index>" string, verified live via
+// src/bridge/tests.rs's lists_spot_pairs). That index is almost certainly
+// DIFFERENT on mainnet (testnet is full of junk test-token listings with
+// unrelated sequential indices) -- re-run lists_spot_pairs against mainnet
+// before ever using the Real toggle, and update the CSV accordingly.
+#define HL_SYMBOL         "BTC/USD"
+#define USD_AMOUNT        25     // how much to buy, in USDC notional
 
-// Must match bridge::AMOUNT_SCALE in the plugin: BrokerBuy2's Amount is a
-// plain C int, so it can't represent a fractional BTC quantity directly.
-// 1 Lot here = 1/AMOUNT_SCALE of one base-asset unit; vLotAmount=1 in
-// assetAdd below means Lots passes straight through as that sub-unit count.
+// Must match bridge::AMOUNT_SCALE in the plugin, and AssetsHyperliquid.csv's
+// LotAmount column (0.00001 = 1/AMOUNT_SCALE): BrokerBuy2's Amount is a
+// plain C int, so it can't represent a fractional BTC quantity directly --
+// 1 Lot here is 1/AMOUNT_SCALE of one base-asset unit.
 #define AMOUNT_SCALE      100000.
 
 var Lots1, Lots2; // the two half-sized sell chunks, set after the buy fills
@@ -48,9 +47,7 @@ function run()
 	}
 
 	if(is(INITRUN)) {
-		// vPrice=0 lets BrokerAsset supply the live price instead of a
-		// hardcoded guess; vLotAmount=1 is the AMOUNT_SCALE convention above.
-		assetAdd(HL_SYMBOL, 0,0,0,0, 1,1,100,1, 1, 0, HL_BROKER_SYMBOL);
+		assetList("AssetsHyperliquid");
 		Step = 0;
 	}
 	asset(HL_SYMBOL);
