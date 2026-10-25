@@ -1,16 +1,28 @@
 // Hyperliquid Buy/Sell Demo (C++ strategy DLL) //////////////////////////
-// Native C++ build of the liquidzorro Hyperliquid broker plugin demo, for
-// Zorro installs where the Strategy dropdown only surfaces compiled "+.cpp"
-// strategies rather than plain Lite-C .c scripts. Functionally identical
-// to HyperliquidBuySellDemo.c -- see that file for the full walkthrough
-// comments; this one only documents what differs for the C++ build.
+// Example strategy for the liquidzorro Hyperliquid broker plugin.
+// Demonstrates the full order round trip through BrokerBuy2/BrokerTrade:
+//   1. Buy ~USD_AMOUNT worth of the asset (one order)
+//   2. Sell half of the filled position (one order)
+//   3. Sell the remaining half (one order)
 //
-// Build: Zorro compiles this automatically (via its [Test]/[Trade] buttons)
-// once Zorro.ini's VCPath points at your Visual C++ Build Tools folder, by
-// invoking Source\VC++\compile64.bat, which links this file together with
-// Source\VC++\ZorroDLL.cpp (the glue that hands over Zorro's entire
-// function table) into one DLL. No separate Cargo/Rust build step --
-// this is unrelated to the liquidzorro.dll broker plugin itself.
+// Setup in Zorro:
+//   - Broker dropdown: select "Hyperliquid"
+//   - User field: leave blank
+//   - Password field: your Hyperliquid private key (0x...)
+//   - Demo/Real toggle: Demo = testnet, Real = mainnet -- start with Demo
+//   - Run in [Trade] mode -- Test/Train/etc. are refused (see the
+//     !is(TRADEMODE) check below)
+//
+// Build: Zorro64 has no Lite-C compiler and (without a Zorro S license)
+// can't compile .cpp strategies on the fly either -- it can only load an
+// already-compiled Release-mode .dll. So this file must be compiled
+// externally, then only the resulting .dll (not this .cpp) goes in
+// Strategy\:
+//   copy this file into <ZorroFolder>\Strategy\, then from that folder:
+//   Source\VC++\compile64.bat "Strategy\HyperliquidBuySellDemo+.cpp" ^
+//     "Strategy\HyperliquidBuySellDemo.dll" "<path to VC\Auxiliary\Build>"
+// This is unrelated to the liquidzorro.dll broker plugin itself, which is
+// a normal Cargo/Rust build (see the top-level README).
 #include <zorro.h>
 
 #define HL_SYMBOL         "BTC/USD"
@@ -32,8 +44,9 @@ DLLFUNC void run()
 	TickTime = 1000;
 	set(LOGFILE);
 
-	if(is(TESTMODE)) {
-		quit("This demo trades live only -- run it in [Trade] mode.");
+	if(!is(TRADEMODE)) {
+		printf("\nUnsupported function: this demo only runs in [Trade] mode (not Test/Train/etc).");
+		quit(0);
 		return;
 	}
 
