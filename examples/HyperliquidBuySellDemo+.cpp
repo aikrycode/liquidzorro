@@ -59,6 +59,7 @@ DLLFUNC void run()
 
 	if(Step == 0) {
 		var Price = priceClose(0); // zorro.h has no zero-arg inline wrapper for this one
+		printf("\n[debug] asset=%s price=%.6f",Asset,Price);
 		if(Price <= 0) return; // wait for a live price
 		Lots = ceil(USD_AMOUNT/Price*AMOUNT_SCALE);
 		enterLong();
