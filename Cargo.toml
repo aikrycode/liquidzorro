@@ -11,3 +11,6 @@ crate-type = ["cdylib"]
 hyperliquid_rust_sdk = { path = "../hyperliquid-rust-sdk" }
 alloy = { version = "1.0", default-features = false, features = ["signer-local"] }
 tokio = { version = "1.0", features = ["rt-multi-thread"] }
+
+[dev-dependencies]
+libloading = "0.8"
