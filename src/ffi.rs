@@ -19,6 +19,7 @@ pub type Date = f64;
 /// `#pragma pack(push,4)` produce an identical 32-byte layout for this
 /// particular field set.
 #[repr(C)]
+#[derive(Debug)]
 pub struct T6 {
     pub time: Date,
     pub f_high: f32,
