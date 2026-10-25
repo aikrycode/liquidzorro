@@ -87,8 +87,8 @@ pub unsafe extern "C" fn BrokerOpen(
 #[no_mangle]
 pub unsafe extern "C" fn BrokerLogin(
     user: *mut c_char,
-    _pwd: *mut c_char,
-    _kind: *mut c_char,
+    pwd: *mut c_char,
+    kind: *mut c_char,
     _accounts: *mut c_char,
 ) -> c_int {
     guard("BrokerLogin", 0, || {
@@ -97,7 +97,17 @@ pub unsafe extern "C" fn BrokerLogin(
         if user.is_null() {
             return 1;
         }
-        match bridge::login() {
+        // Zorro's Password field holds the Hyperliquid private key (there's
+        // no separate "API key" concept for a raw EVM wallet, so the User
+        // field goes unused); its Real/Demo toggle selects mainnet/testnet.
+        let privkey = read_cstr(pwd);
+        let base_url = match read_cstr(kind) {
+            Some(k) if k.eq_ignore_ascii_case("real") => hyperliquid_rust_sdk::BaseUrl::Mainnet,
+            // Default to testnet (including an unrecognized/missing Type)
+            // so an ambiguous login can never accidentally hit mainnet.
+            _ => hyperliquid_rust_sdk::BaseUrl::Testnet,
+        };
+        match bridge::login(privkey, base_url) {
             Ok(()) => 1,
             Err(e) => {
                 state::log_error(&format!("Hyperliquid login failed: {e}"));
