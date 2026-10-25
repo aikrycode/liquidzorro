@@ -25,9 +25,9 @@ const TESTNET_PRIVKEY_ENV: &str = "HL_TESTNET_PRIVKEY";
 /// falling back to `HL_TESTNET_PRIVKEY` only if that field is empty, for our
 /// own test convenience) against `base_url` (selected by Zorro's Real/Demo
 /// toggle: Demo -> testnet, Real -> mainnet). Stores the resulting clients
-/// in `state`. Returns an error description on failure for `BrokerLogin` to
-/// report via `state::log_error`.
-pub fn login(privkey: Option<&str>, base_url: BaseUrl) -> Result<(), String> {
+/// in `state`, and returns the wallet address on success so `BrokerLogin`
+/// can report it via `state::log_message`.
+pub fn login(privkey: Option<&str>, base_url: BaseUrl) -> Result<alloy::primitives::Address, String> {
     let privkey = match privkey {
         Some(k) if !k.is_empty() => k.to_string(),
         _ => env::var(TESTNET_PRIVKEY_ENV)
@@ -56,7 +56,7 @@ pub fn login(privkey: Option<&str>, base_url: BaseUrl) -> Result<(), String> {
     if !state::init(info_client, exchange_client, address) {
         return Err("already logged in".to_string());
     }
-    Ok(())
+    Ok(address)
 }
 
 /// `BrokerBuy2`'s `Amount` is a plain C `int`, so it can't represent a

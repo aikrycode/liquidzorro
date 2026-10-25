@@ -48,10 +48,15 @@ pub fn set_callbacks(error: Option<ErrorFn>, progress: Option<ProgressFn>) {
     let _ = CALLBACKS.set(Callbacks { error, progress });
 }
 
-/// Reports a message back to Zorro via the `fpError` callback from `BrokerOpen`,
-/// falling back to stderr if the plugin hasn't been opened yet (shouldn't happen
-/// in practice, since Zorro always calls BrokerOpen first).
-pub fn log_error(msg: &str) {
+/// Reports a message back to Zorro via the `fpError` callback from `BrokerOpen`.
+/// Despite the name Zorro gave this callback, real plugins (Simulation.cpp,
+/// Bittrex.cpp) use it for ordinary status messages too, not just errors --
+/// it's the only channel back to Zorro's message window, so every
+/// significant step (login success/failure, orders, lookups that fail)
+/// should go through here for visibility. Falls back to stderr if the
+/// plugin hasn't been opened yet (shouldn't happen -- Zorro always calls
+/// BrokerOpen first).
+pub fn log_message(msg: &str) {
     match CALLBACKS.get().and_then(|c| c.error) {
         Some(cb) => {
             if let Ok(c_msg) = CString::new(msg) {

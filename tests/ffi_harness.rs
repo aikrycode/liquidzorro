@@ -209,7 +209,7 @@ fn drives_every_export_like_zorro_would() {
         );
         assert_eq!(rc, 0, "BrokerBuy2 should fail without being logged in");
         let err = take_last_error().expect("expected a BrokerBuy2 failure message");
-        assert!(err.contains("BrokerBuy2 failed"), "unexpected message: {err}");
+        assert!(err.contains("BrokerBuy2") && err.contains("FAILED"), "unexpected message: {err}");
 
         let (mut open, mut close, mut cost, mut profit) = (f64::MIN, f64::MIN, f64::MIN, f64::MIN);
         let rc = broker_trade(100_000, &mut open, &mut close, &mut cost, &mut profit);

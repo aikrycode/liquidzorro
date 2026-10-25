@@ -54,12 +54,12 @@ unsafe fn read_cstr<'a>(ptr: *const c_char) -> Option<&'a str> {
 }
 
 /// Runs `f`, catching any panic so it can't unwind across the FFI boundary.
-/// On panic, logs via `state::log_error` and returns `default` instead.
+/// On panic, logs via `state::log_message` and returns `default` instead.
 fn guard<R>(label: &str, default: R, f: impl FnOnce() -> R) -> R {
     match panic::catch_unwind(AssertUnwindSafe(f)) {
         Ok(v) => v,
         Err(_) => {
-            state::log_error(&format!("liquidzorro: panic in {label}, returning a safe default"));
+            state::log_message(&format!("liquidzorro: panic in {label}, returning a safe default"));
             default
         }
     }
@@ -80,6 +80,7 @@ pub unsafe extern "C" fn BrokerOpen(
         let progress_cb = (!fp_progress.is_null())
             .then(|| std::mem::transmute::<*const c_void, state::ProgressFn>(fp_progress));
         state::set_callbacks(error_cb, progress_cb);
+        state::log_message("Hyperliquid plugin loaded (liquidzorro)");
         PLUGIN_VERSION
     })
 }
@@ -95,22 +96,35 @@ pub unsafe extern "C" fn BrokerLogin(
         // Zorro calls BrokerLogin(NULL, ...) to log out; we hold no per-session
         // resources worth tearing down yet, so just report success.
         if user.is_null() {
+            state::log_message("Hyperliquid: logout requested");
             return 1;
         }
         // Zorro's Password field holds the Hyperliquid private key (there's
         // no separate "API key" concept for a raw EVM wallet, so the User
         // field goes unused); its Real/Demo toggle selects mainnet/testnet.
         let privkey = read_cstr(pwd);
-        let base_url = match read_cstr(kind) {
-            Some(k) if k.eq_ignore_ascii_case("real") => hyperliquid_rust_sdk::BaseUrl::Mainnet,
+        let is_mainnet = matches!(read_cstr(kind), Some(k) if k.eq_ignore_ascii_case("real"));
+        let base_url = if is_mainnet {
+            hyperliquid_rust_sdk::BaseUrl::Mainnet
+        } else {
             // Default to testnet (including an unrecognized/missing Type)
             // so an ambiguous login can never accidentally hit mainnet.
-            _ => hyperliquid_rust_sdk::BaseUrl::Testnet,
+            hyperliquid_rust_sdk::BaseUrl::Testnet
         };
+        state::log_message(&format!(
+            "Hyperliquid: logging in ({})...",
+            if is_mainnet { "mainnet" } else { "testnet" }
+        ));
         match bridge::login(privkey, base_url) {
-            Ok(()) => 1,
+            Ok(address) => {
+                state::log_message(&format!(
+                    "Hyperliquid: login OK ({}), address={address}",
+                    if is_mainnet { "mainnet" } else { "testnet" }
+                ));
+                1
+            }
             Err(e) => {
-                state::log_error(&format!("Hyperliquid login failed: {e}"));
+                state::log_message(&format!("Hyperliquid: login FAILED: {e}"));
                 0
             }
         }
@@ -149,9 +163,17 @@ pub unsafe extern "C" fn BrokerAsset(
 ) -> c_int {
     guard("BrokerAsset", 0, || {
         let Some(symbol) = read_cstr(asset) else {
+            state::log_message("BrokerAsset: invalid/missing asset name");
             return 0;
         };
+        if state::get().is_none() {
+            state::log_message(&format!("BrokerAsset({symbol}): not logged in"));
+            return 0;
+        }
         let Some(price) = bridge::asset_price(symbol) else {
+            state::log_message(&format!(
+                "BrokerAsset({symbol}): price unavailable -- check the symbol matches Hyperliquid's spot_meta() exactly"
+            ));
             return 0;
         };
 
@@ -199,12 +221,16 @@ pub unsafe extern "C" fn BrokerHistory2(
 ) -> c_int {
     guard("BrokerHistory2", 0, || {
         let Some(symbol) = read_cstr(asset) else {
+            state::log_message("BrokerHistory2: invalid/missing asset name");
             return 0;
         };
         if ticks.is_null() || n_ticks <= 0 {
             return 0;
         }
         let Some(candles) = bridge::history(symbol, t_end, n_tick_minutes, n_ticks) else {
+            state::log_message(&format!(
+                "BrokerHistory2({symbol}): candle history unavailable (not logged in, or bad symbol)"
+            ));
             return 0;
         };
         for (i, candle) in candles.iter().enumerate() {
@@ -234,6 +260,7 @@ pub unsafe extern "C" fn BrokerAccount(
 ) -> c_int {
     guard("BrokerAccount", 0, || {
         let Some((balance, trade_val, margin_val)) = bridge::account_balance() else {
+            state::log_message("BrokerAccount: balance unavailable (not logged in?)");
             return 0;
         };
         if !p_balance.is_null() {
@@ -264,8 +291,10 @@ pub unsafe extern "C" fn BrokerBuy2(
     guard("BrokerBuy2", 0, || {
         let _ = stop_dist; // TODO(Phase 4): wire to a Hyperliquid trigger order
         let Some(symbol) = read_cstr(asset) else {
+            state::log_message("BrokerBuy2: invalid/missing asset name");
             return 0;
         };
+        let side = if amount > 0 { "buy" } else { "sell" };
         match bridge::place_order(symbol, amount, limit) {
             Ok((zorro_id, price, fill)) => {
                 if !p_price.is_null() {
@@ -274,10 +303,13 @@ pub unsafe extern "C" fn BrokerBuy2(
                 if !p_fill.is_null() {
                     *p_fill = fill;
                 }
+                state::log_message(&format!(
+                    "BrokerBuy2: {side} {symbol} OK, filled={fill} @ {price}, trade id {zorro_id}"
+                ));
                 zorro_id
             }
             Err(e) => {
-                state::log_error(&format!("BrokerBuy2 failed: {e}"));
+                state::log_message(&format!("BrokerBuy2: {side} {symbol} FAILED: {e}"));
                 0
             }
         }
@@ -294,6 +326,7 @@ pub unsafe extern "C" fn BrokerTrade(
 ) -> c_int {
     guard("BrokerTrade", NAY, || {
         let Some((open, close, cost, profit, fill)) = bridge::trade_status(trade_id) else {
+            state::log_message(&format!("BrokerTrade({trade_id}): unknown trade id"));
             return NAY;
         };
         if !p_open.is_null() {
