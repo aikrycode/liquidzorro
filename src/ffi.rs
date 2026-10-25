@@ -4,9 +4,16 @@
 //! `Simulation.cpp` sample plugin from a Zorro S 2026 (build 3.1.1.2)
 //! install at `C:\Users\Matusovsky\Zorro2026`. See the plan file for the
 //! exact verbatim declarations this was checked against.
+//!
+//! Every exported function is wrapped in `guard()`: an unwinding Rust panic
+//! that reached across this `extern "C"` boundary would be undefined
+//! behavior inside Zorro's process, so any panic here is caught and turned
+//! into an ordinary failure return instead of risking a crash of the whole
+//! host application.
 
 use std::ffi::{c_void, CStr};
 use std::os::raw::{c_char, c_int};
+use std::panic::{self, AssertUnwindSafe};
 
 use crate::{bridge, state};
 
@@ -46,21 +53,35 @@ unsafe fn read_cstr<'a>(ptr: *const c_char) -> Option<&'a str> {
     CStr::from_ptr(ptr).to_str().ok()
 }
 
+/// Runs `f`, catching any panic so it can't unwind across the FFI boundary.
+/// On panic, logs via `state::log_error` and returns `default` instead.
+fn guard<R>(label: &str, default: R, f: impl FnOnce() -> R) -> R {
+    match panic::catch_unwind(AssertUnwindSafe(f)) {
+        Ok(v) => v,
+        Err(_) => {
+            state::log_error(&format!("liquidzorro: panic in {label}, returning a safe default"));
+            default
+        }
+    }
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn BrokerOpen(
     name: *mut c_char,
     fp_error: *const c_void,
     fp_progress: *const c_void,
 ) -> c_int {
-    if !name.is_null() {
-        std::ptr::copy_nonoverlapping(PLUGIN_NAME.as_ptr(), name as *mut u8, PLUGIN_NAME.len());
-    }
-    let error_cb = (!fp_error.is_null())
-        .then(|| std::mem::transmute::<*const c_void, state::ErrorFn>(fp_error));
-    let progress_cb = (!fp_progress.is_null())
-        .then(|| std::mem::transmute::<*const c_void, state::ProgressFn>(fp_progress));
-    state::set_callbacks(error_cb, progress_cb);
-    PLUGIN_VERSION
+    guard("BrokerOpen", 0, || {
+        if !name.is_null() {
+            std::ptr::copy_nonoverlapping(PLUGIN_NAME.as_ptr(), name as *mut u8, PLUGIN_NAME.len());
+        }
+        let error_cb = (!fp_error.is_null())
+            .then(|| std::mem::transmute::<*const c_void, state::ErrorFn>(fp_error));
+        let progress_cb = (!fp_progress.is_null())
+            .then(|| std::mem::transmute::<*const c_void, state::ProgressFn>(fp_progress));
+        state::set_callbacks(error_cb, progress_cb);
+        PLUGIN_VERSION
+    })
 }
 
 #[no_mangle]
@@ -70,33 +91,37 @@ pub unsafe extern "C" fn BrokerLogin(
     _kind: *mut c_char,
     _accounts: *mut c_char,
 ) -> c_int {
-    // Zorro calls BrokerLogin(NULL, ...) to log out; we hold no per-session
-    // resources worth tearing down yet, so just report success.
-    if user.is_null() {
-        return 1;
-    }
-    match bridge::login() {
-        Ok(()) => 1,
-        Err(e) => {
-            state::log_error(&format!("Hyperliquid login failed: {e}"));
-            0
+    guard("BrokerLogin", 0, || {
+        // Zorro calls BrokerLogin(NULL, ...) to log out; we hold no per-session
+        // resources worth tearing down yet, so just report success.
+        if user.is_null() {
+            return 1;
         }
-    }
+        match bridge::login() {
+            Ok(()) => 1,
+            Err(e) => {
+                state::log_error(&format!("Hyperliquid login failed: {e}"));
+                0
+            }
+        }
+    })
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn BrokerTime(p_time_gmt: *mut Date) -> c_int {
-    if state::get().is_none() {
-        return 0;
-    }
-    if !p_time_gmt.is_null() {
-        let unix_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(0);
-        *p_time_gmt = unix_ms as f64 / 86_400_000.0 + 25569.0;
-    }
-    2 // online
+    guard("BrokerTime", 0, || {
+        if state::get().is_none() {
+            return 0;
+        }
+        if !p_time_gmt.is_null() {
+            let unix_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            *p_time_gmt = unix_ms as f64 / 86_400_000.0 + 25569.0;
+        }
+        2 // online
+    })
 }
 
 #[no_mangle]
@@ -112,43 +137,45 @@ pub unsafe extern "C" fn BrokerAsset(
     p_roll_long: *mut f64,
     p_roll_short: *mut f64,
 ) -> c_int {
-    let Some(symbol) = read_cstr(asset) else {
-        return 0;
-    };
-    let Some(price) = bridge::asset_price(symbol) else {
-        return 0;
-    };
+    guard("BrokerAsset", 0, || {
+        let Some(symbol) = read_cstr(asset) else {
+            return 0;
+        };
+        let Some(price) = bridge::asset_price(symbol) else {
+            return 0;
+        };
 
-    if !p_price.is_null() {
-        *p_price = price;
-    }
-    // Placeholders until spot_meta_and_asset_contexts() is wired in to supply
-    // real tick size / spread; Hyperliquid spot has no margin or rollover.
-    if !p_spread.is_null() {
-        *p_spread = 0.0;
-    }
-    if !p_volume.is_null() {
-        *p_volume = 0.0;
-    }
-    if !p_pip.is_null() {
-        *p_pip = 1.0;
-    }
-    if !p_pip_cost.is_null() {
-        *p_pip_cost = 1.0;
-    }
-    if !p_min_amount.is_null() {
-        *p_min_amount = 0.0;
-    }
-    if !p_margin_cost.is_null() {
-        *p_margin_cost = 100.0; // spot = fully collateralized, no leverage
-    }
-    if !p_roll_long.is_null() {
-        *p_roll_long = 0.0;
-    }
-    if !p_roll_short.is_null() {
-        *p_roll_short = 0.0;
-    }
-    1
+        if !p_price.is_null() {
+            *p_price = price;
+        }
+        // Placeholders until spot_meta_and_asset_contexts() is wired in to supply
+        // real tick size / spread; Hyperliquid spot has no margin or rollover.
+        if !p_spread.is_null() {
+            *p_spread = 0.0;
+        }
+        if !p_volume.is_null() {
+            *p_volume = 0.0;
+        }
+        if !p_pip.is_null() {
+            *p_pip = 1.0;
+        }
+        if !p_pip_cost.is_null() {
+            *p_pip_cost = 1.0;
+        }
+        if !p_min_amount.is_null() {
+            *p_min_amount = 0.0;
+        }
+        if !p_margin_cost.is_null() {
+            *p_margin_cost = 100.0; // spot = fully collateralized, no leverage
+        }
+        if !p_roll_long.is_null() {
+            *p_roll_long = 0.0;
+        }
+        if !p_roll_short.is_null() {
+            *p_roll_short = 0.0;
+        }
+        1
+    })
 }
 
 #[no_mangle]
@@ -160,30 +187,32 @@ pub unsafe extern "C" fn BrokerHistory2(
     n_ticks: c_int,
     ticks: *mut T6,
 ) -> c_int {
-    let Some(symbol) = read_cstr(asset) else {
-        return 0;
-    };
-    if ticks.is_null() || n_ticks <= 0 {
-        return 0;
-    }
-    let Some(candles) = bridge::history(symbol, t_end, n_tick_minutes, n_ticks) else {
-        return 0;
-    };
-    for (i, candle) in candles.iter().enumerate() {
-        std::ptr::write(
-            ticks.add(i),
-            T6 {
-                time: candle.time,
-                f_high: candle.f_high,
-                f_low: candle.f_low,
-                f_open: candle.f_open,
-                f_close: candle.f_close,
-                f_val: candle.f_val,
-                f_vol: candle.f_vol,
-            },
-        );
-    }
-    candles.len() as c_int
+    guard("BrokerHistory2", 0, || {
+        let Some(symbol) = read_cstr(asset) else {
+            return 0;
+        };
+        if ticks.is_null() || n_ticks <= 0 {
+            return 0;
+        }
+        let Some(candles) = bridge::history(symbol, t_end, n_tick_minutes, n_ticks) else {
+            return 0;
+        };
+        for (i, candle) in candles.iter().enumerate() {
+            std::ptr::write(
+                ticks.add(i),
+                T6 {
+                    time: candle.time,
+                    f_high: candle.f_high,
+                    f_low: candle.f_low,
+                    f_open: candle.f_open,
+                    f_close: candle.f_close,
+                    f_val: candle.f_val,
+                    f_vol: candle.f_vol,
+                },
+            );
+        }
+        candles.len() as c_int
+    })
 }
 
 #[no_mangle]
@@ -193,19 +222,21 @@ pub unsafe extern "C" fn BrokerAccount(
     p_trade_val: *mut f64,
     p_margin_val: *mut f64,
 ) -> c_int {
-    let Some((balance, trade_val, margin_val)) = bridge::account_balance() else {
-        return 0;
-    };
-    if !p_balance.is_null() {
-        *p_balance = balance;
-    }
-    if !p_trade_val.is_null() {
-        *p_trade_val = trade_val;
-    }
-    if !p_margin_val.is_null() {
-        *p_margin_val = margin_val;
-    }
-    1
+    guard("BrokerAccount", 0, || {
+        let Some((balance, trade_val, margin_val)) = bridge::account_balance() else {
+            return 0;
+        };
+        if !p_balance.is_null() {
+            *p_balance = balance;
+        }
+        if !p_trade_val.is_null() {
+            *p_trade_val = trade_val;
+        }
+        if !p_margin_val.is_null() {
+            *p_margin_val = margin_val;
+        }
+        1
+    })
 }
 
 /// Positive `Amount` buys, negative sells/closes -- Zorro's ABI has no
@@ -220,25 +251,27 @@ pub unsafe extern "C" fn BrokerBuy2(
     p_price: *mut f64,
     p_fill: *mut c_int,
 ) -> c_int {
-    let _ = stop_dist; // TODO(Phase 4): wire to a Hyperliquid trigger order
-    let Some(symbol) = read_cstr(asset) else {
-        return 0;
-    };
-    match bridge::place_order(symbol, amount, limit) {
-        Ok((zorro_id, price, fill)) => {
-            if !p_price.is_null() {
-                *p_price = price;
+    guard("BrokerBuy2", 0, || {
+        let _ = stop_dist; // TODO(Phase 4): wire to a Hyperliquid trigger order
+        let Some(symbol) = read_cstr(asset) else {
+            return 0;
+        };
+        match bridge::place_order(symbol, amount, limit) {
+            Ok((zorro_id, price, fill)) => {
+                if !p_price.is_null() {
+                    *p_price = price;
+                }
+                if !p_fill.is_null() {
+                    *p_fill = fill;
+                }
+                zorro_id
             }
-            if !p_fill.is_null() {
-                *p_fill = fill;
+            Err(e) => {
+                state::log_error(&format!("BrokerBuy2 failed: {e}"));
+                0
             }
-            zorro_id
         }
-        Err(e) => {
-            state::log_error(&format!("BrokerBuy2 failed: {e}"));
-            0
-        }
-    }
+    })
 }
 
 #[no_mangle]
@@ -249,22 +282,24 @@ pub unsafe extern "C" fn BrokerTrade(
     p_cost: *mut f64,
     p_profit: *mut f64,
 ) -> c_int {
-    let Some((open, close, cost, profit, fill)) = bridge::trade_status(trade_id) else {
-        return NAY;
-    };
-    if !p_open.is_null() {
-        *p_open = open;
-    }
-    if !p_close.is_null() {
-        *p_close = close;
-    }
-    if !p_cost.is_null() {
-        *p_cost = cost;
-    }
-    if !p_profit.is_null() {
-        *p_profit = profit;
-    }
-    fill
+    guard("BrokerTrade", NAY, || {
+        let Some((open, close, cost, profit, fill)) = bridge::trade_status(trade_id) else {
+            return NAY;
+        };
+        if !p_open.is_null() {
+            *p_open = open;
+        }
+        if !p_close.is_null() {
+            *p_close = close;
+        }
+        if !p_cost.is_null() {
+            *p_cost = cost;
+        }
+        if !p_profit.is_null() {
+            *p_profit = profit;
+        }
+        fill
+    })
 }
 
 /// TODO(Phase 4): GET_COMPLIANCE/GET_MAXREQUESTS/GET_BROKERZONE/GET_MAXTICKS/
@@ -272,5 +307,5 @@ pub unsafe extern "C" fn BrokerTrade(
 /// session actually requests.
 #[no_mangle]
 pub unsafe extern "C" fn BrokerCommand(_command: c_int, _parameter: isize) -> f64 {
-    0.0
+    guard("BrokerCommand", 0.0, || 0.0)
 }

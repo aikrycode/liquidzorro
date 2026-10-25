@@ -88,7 +88,14 @@ pub fn init(
 pub fn register_trade(coin: &str, oid: u64, is_buy: bool, entry_price: f64, entry_sz: f64) -> i32 {
     let id = NEXT_TRADE_ID.fetch_add(1, Ordering::Relaxed);
     if let Some(plugin) = get() {
-        plugin.trades.lock().unwrap().insert(
+        // Recover from poisoning rather than cascading a panic: a previous
+        // panic while the lock was held shouldn't make every future trade
+        // lookup through the FFI boundary panic too.
+        plugin
+            .trades
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
             id,
             TradeInfo {
                 coin: coin.to_string(),
@@ -103,5 +110,10 @@ pub fn register_trade(coin: &str, oid: u64, is_buy: bool, entry_price: f64, entr
 }
 
 pub fn get_trade(zorro_id: i32) -> Option<TradeInfo> {
-    get()?.trades.lock().unwrap().get(&zorro_id).cloned()
+    get()?
+        .trades
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&zorro_id)
+        .cloned()
 }

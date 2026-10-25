@@ -1,5 +1,7 @@
 # liquidzorro
 
+> **Disclaimer.** This software is pre-release, experimental ("beta") software provided for testing and development purposes. It interacts with live financial exchanges and can place real orders and move real funds. It is provided "AS IS", WITHOUT WARRANTY OF ANY KIND, express or implied, including but not limited to warranties of merchantability, fitness for a particular purpose, accuracy, or non-infringement. The authors and contributors assume no liability and disclaim all responsibility for any financial loss, data loss, trading loss, missed trades, erroneous orders, or other damages of any kind arising from the use, misuse, or inability to use this software, whether on testnet or mainnet. By using this code, you acknowledge and accept that you do so entirely at your own risk, and that you are solely responsible for reviewing, testing, and validating its behavior before relying on it with any funds.
+
 Zorro broker plugin (C/C++ DLL) for trading Hyperliquid perpetuals and spot.
 
 The plugin is written in Rust and compiled as a `cdylib` exposing the plain C
@@ -37,35 +39,39 @@ liquidzorro.dll  (Rust cdylib, in Zorro's Plugin64\ folder)
 | `Cargo.toml` | Declares the crate as a `cdylib`; depends on `hyperliquid_rust_sdk` (path dependency on the sibling SDK checkout), `alloy` (for `PrivateKeySigner`), and `tokio`. |
 | `src/lib.rs` | Crate root; wires up the module tree and re-exports the FFI surface. |
 | `src/ffi.rs` | The Zorro-facing C ABI exports: `BrokerOpen`, `BrokerLogin`, `BrokerTime`, `BrokerAsset`, `BrokerHistory2`, `BrokerAccount`, `BrokerBuy2`, `BrokerTrade`, and a stub `BrokerCommand`. Signatures verified against a real Zorro S 2026 install's `trading.h` and `Simulation.cpp` sample plugin. |
-| `src/bridge.rs` | Sync-to-async bridge: `login`/`asset_price`/`history`/`place_order`/`trade_status`/`account_balance`, each blocking on the Tokio runtime to drive the async SDK, plus the OLE-date <-> Unix-time conversions Zorro's `DATE` type needs. Includes `#[ignore]`d live smoke tests against Hyperliquid testnet (see Local setup). |
+| `src/bridge/mod.rs` | Sync-to-async bridge: `login`/`asset_price`/`history`/`place_order`/`trade_status`/`account_balance`, each blocking on the Tokio runtime to drive the async SDK, plus the OLE-date <-> Unix-time conversions Zorro's `DATE` type needs. |
+| `src/bridge/tests.rs` | `#[ignore]`d live smoke tests against Hyperliquid testnet, named by what they verify (see Local setup). |
 | `src/state.rs` | Shared plugin state: the logged-in `InfoClient`/`ExchangeClient`/wallet address, open-trade bookkeeping (Zorro trade id -> Hyperliquid `oid`), and the `fpError`/`fpProgress` callback pointers captured in `BrokerOpen` (used to report messages back to Zorro instead of stdout). |
 | `src/runtime.rs` | Owns the single lazily-started Tokio runtime used to drive the async SDK from Zorro's blocking calls. |
 | `src/assets.rs` | Placeholder for a later pass: mapping Hyperliquid's spot asset universe to Zorro's expected asset list format (tick size, real spread) instead of the `BrokerAsset` placeholders currently in `ffi.rs`. |
+| `tests/ffi_harness.rs` | Loads the compiled `liquidzorro.dll` dynamically and calls every export through its real C signature with real raw pointers and callback functions -- the only test that exercises the actual FFI boundary the way Zorro will, rather than calling our Rust functions directly. Network-free (runs with `cargo test`, no `--ignored` needed). |
+
+Every exported function in `ffi.rs` is also wrapped in a panic guard: since an unwinding Rust panic crossing an `extern "C"` boundary is undefined behavior, any unexpected panic is caught and turned into an ordinary failure return (logged via the error callback) instead of risking a crash of Zorro's whole process.
 
 ## Local setup
 
-### Dev/test wallet
+### Hyperliquid account setup, step by step
 
-Set `HL_TESTNET_PRIVKEY` (an EVM private key, `0x`-prefixed) before `BrokerLogin` can succeed; never commit it (see `.gitignore`'s `.env` entry). A throwaway key can be generated locally with `alloy`'s `PrivateKeySigner::random()` -- see git history for the one-off helper used during initial setup. Treat any key you use for this as holding real value the moment you fund it (see below), not as a disposable secret.
+This is the exact sequence that worked when setting this project up. It walks through creating a dedicated wallet, getting it recognized by Hyperliquid, and getting testnet funds into it -- the awkward part being that Hyperliquid's testnet faucet will not release funds to a wallet with no mainnet history, so a small real-money step is unavoidable.
 
-### Getting a Hyperliquid testnet balance (manual, one-time per wallet)
-
-Hyperliquid's testnet faucet is anti-sybil gated: it will **not** release test USDC to a fresh wallet until that wallet has a real mainnet deposit history. The flow that worked:
-
-1. Send a small amount of real USDC (a few dollars) on **Arbitrum One** to the wallet's address.
-2. Go to `app.hyperliquid.xyz` (mainnet) and deposit that USDC into Hyperliquid itself.
-3. Go to `app.hyperliquid-testnet.xyz` (a separate app/environment -- connecting here does not touch mainnet) and connect the *same* wallet.
-4. The faucet (under the account/portfolio menu, or the root page if not visible from `/trade`) now unlocks; claiming it credits ~1000 testnet USDC, play money with no real value.
-
-Because step 1-2 use real funds, the dev wallet ends up holding a small **real** balance on mainnet permanently (ours has ~5 USDC) -- it's not a pure throwaway anymore once you've done this. Low-risk given the small amount, but worth knowing if that key was ever shared/logged anywhere.
+1. **Generate a dedicated wallet/private key for this project.** Don't reuse a wallet you use elsewhere. A throwaway EVM key can be generated locally with `alloy`'s `PrivateKeySigner::random()` (see git history for the one-off helper script used here), or with any wallet tool you trust (e.g. create a brand-new account in MetaMask). You need the private key (`0x`-prefixed hex) and the address it corresponds to.
+2. **Important mindset shift once you fund it:** the moment you send any real money to this wallet (step 3), it stops being a disposable throwaway secret and becomes a wallet holding real value. Treat the private key accordingly -- don't paste it somewhere it'll be logged or shared if you can avoid it, and if it ever is exposed, treat any funds in it as at risk.
+3. **Send a small amount of real USDC to that wallet on Arbitrum One.** A few dollars is enough (this project used ~6 USDC). This is required before Hyperliquid's testnet faucet will cooperate -- see step 5.
+4. **Deposit that USDC into Hyperliquid mainnet.** Go to `app.hyperliquid.xyz`, connect the wallet, and deposit the USDC from Arbitrum into Hyperliquid itself (minimum to deposit seems to be 5 USDC). This is real money on a real exchange -- small amount, but real.
+5. **Go to the separate testnet app and connect the same wallet.** `app.hyperliquid-testnet.xyz` is a completely separate environment from mainnet -- connecting a wallet there doesn't touch mainnet funds or state. Hyperliquid's testnet faucet is anti-sybil gated: it checks for a real mainnet deposit history (step 4) before it will let a wallet claim test funds, which is why step 3-4 had to happen first.
+6. **Claim the testnet faucet.** Once connected on the testnet app, find the "Faucet" option (under the account/portfolio menu, or on the root page if it's not visible from `/trade`) and claim it. This credits ~1000 testnet USDC -- play money with no real value, usable for as much order-placing/cancelling as you like without financial consequence.
+7. **Set the private key as an environment variable for this project** (never commit it -- see `.gitignore`'s `.env` entry):
+   ```powershell
+   $env:HL_TESTNET_PRIVKEY = "0x..."
+   ```
+   `BrokerLogin` (and the live tests below) read this to authenticate against Hyperliquid testnet.
 
 ### Running the live smoke tests
 
-The `#[ignore]`d tests in `src/bridge.rs` exercise the real testnet API:
+With `HL_TESTNET_PRIVKEY` set (step 7 above), the `#[ignore]`d tests in `src/bridge/tests.rs` exercise the real testnet API:
 
 ```powershell
-$env:HL_TESTNET_PRIVKEY = "0x..."
 cargo test --lib -- --ignored --nocapture
 ```
 
-`login_and_query_testnet` is read-only (spot_meta/all_mids/candles_snapshot) and never spends anything. `buy_and_sell_smallest_unit` places and immediately closes a 1-unit order, so it does spend a little testnet USDC -- only slippage is lost (a few cents), since the round trip returns the rest. Both need a funded testnet wallet per the steps above.
+`connects_and_reads_market_data` is read-only (spot_meta/all_mids/candles_snapshot) and never spends anything. `places_and_closes_a_spot_order` places and immediately closes an order sized just above Hyperliquid's $10 minimum notional, sweeping any partial-fill leftover afterward -- it does spend a little testnet USDC, but only slippage is lost (a few cents), since the round trip returns the rest. `flattens_leftover_balance` is a standalone cleanup if a prior run ever leaves a position open. All three need a funded testnet wallet per the steps above.
