@@ -21,23 +21,28 @@ use crate::{runtime, state};
 
 const TESTNET_PRIVKEY_ENV: &str = "HL_TESTNET_PRIVKEY";
 
-/// Logs into Hyperliquid testnet using the private key from `HL_TESTNET_PRIVKEY`
-/// and stores the resulting clients in `state`. Returns an error description
-/// on failure (bad/missing key, unreachable API, etc.) for `BrokerLogin` to
+/// Logs into Hyperliquid using `privkey` (from Zorro's Password field --
+/// falling back to `HL_TESTNET_PRIVKEY` only if that field is empty, for our
+/// own test convenience) against `base_url` (selected by Zorro's Real/Demo
+/// toggle: Demo -> testnet, Real -> mainnet). Stores the resulting clients
+/// in `state`. Returns an error description on failure for `BrokerLogin` to
 /// report via `state::log_error`.
-pub fn login() -> Result<(), String> {
-    let privkey = env::var(TESTNET_PRIVKEY_ENV)
-        .map_err(|_| format!("{TESTNET_PRIVKEY_ENV} is not set"))?;
+pub fn login(privkey: Option<&str>, base_url: BaseUrl) -> Result<(), String> {
+    let privkey = match privkey {
+        Some(k) if !k.is_empty() => k.to_string(),
+        _ => env::var(TESTNET_PRIVKEY_ENV)
+            .map_err(|_| "no password supplied and HL_TESTNET_PRIVKEY is not set".to_string())?,
+    };
     let wallet: PrivateKeySigner = privkey
         .parse()
         .map_err(|e| format!("invalid private key: {e}"))?;
     let address = wallet.address();
 
     let (info_client, exchange_client) = runtime::get().block_on(async {
-        let info_client = InfoClient::new(None, Some(BaseUrl::Testnet))
+        let info_client = InfoClient::new(None, Some(base_url))
             .await
             .map_err(|e| format!("InfoClient connect failed: {e}"))?;
-        let exchange_client = ExchangeClient::new(None, wallet, Some(BaseUrl::Testnet), None, None)
+        let exchange_client = ExchangeClient::new(None, wallet, Some(base_url), None, None)
             .await
             .map_err(|e| format!("ExchangeClient connect failed: {e}"))?;
         // Sanity-check connectivity before reporting a successful login.

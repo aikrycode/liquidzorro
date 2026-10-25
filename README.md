@@ -60,11 +60,10 @@ This is the exact sequence that worked when setting this project up. It walks th
 4. **Deposit that USDC into Hyperliquid mainnet.** Go to `app.hyperliquid.xyz`, connect the wallet, and deposit the USDC from Arbitrum into Hyperliquid itself (minimum to deposit seems to be 5 USDC). This is real money on a real exchange -- small amount, but real.
 5. **Go to the separate testnet app and connect the same wallet.** `app.hyperliquid-testnet.xyz` is a completely separate environment from mainnet -- connecting a wallet there doesn't touch mainnet funds or state. Hyperliquid's testnet faucet is anti-sybil gated: it checks for a real mainnet deposit history (step 4) before it will let a wallet claim test funds, which is why step 3-4 had to happen first.
 6. **Claim the testnet faucet.** Once connected on the testnet app, find the "Faucet" option (under the account/portfolio menu, or on the root page if it's not visible from `/trade`) and claim it. This credits ~1000 testnet USDC -- play money with no real value, usable for as much order-placing/cancelling as you like without financial consequence.
-7. **Set the private key as an environment variable for this project** (never commit it -- see `.gitignore`'s `.env` entry):
+7. **Keep the private key handy.** Inside Zorro, it goes in the Password field (see "Installing and running inside Zorro" below); for the Rust-level dev/test workflow below, set it as an environment variable instead (never commit it -- see `.gitignore`'s `.env` entry):
    ```powershell
    $env:HL_TESTNET_PRIVKEY = "0x..."
    ```
-   `BrokerLogin` (and the live tests below) read this to authenticate against Hyperliquid testnet.
 
 ### Running the live smoke tests
 
@@ -75,3 +74,27 @@ cargo test --lib -- --ignored --nocapture
 ```
 
 `connects_and_reads_market_data` is read-only (spot_meta/all_mids/candles_snapshot) and never spends anything. `places_and_closes_a_spot_order` places and immediately closes an order sized just above Hyperliquid's $10 minimum notional, sweeping any partial-fill leftover afterward -- it does spend a little testnet USDC, but only slippage is lost (a few cents), since the round trip returns the rest. `flattens_leftover_balance` is a standalone cleanup if a prior run ever leaves a position open. All three need a funded testnet wallet per the steps above.
+
+## Installing and running inside Zorro
+
+> The steps below describe how Zorro's plugin loading and login UI work generically (per the Zorro manual and the sample plugins it ships with, e.g. `Bittrex.cpp`) and are accurate for those mechanics, but this project hasn't yet run inside an actual live Zorro session -- so treat the exact on-screen layout as a best-effort description, not a verified screenshot, until confirmed.
+
+1. **Build the release DLL**:
+   ```powershell
+   cargo build --release
+   ```
+   This produces `target\release\liquidzorro.dll`.
+2. **Copy it into Zorro's plugin folder**, naming it after the broker (matching the convention every other broker plugin DLL in that folder follows, e.g. `Oanda.dll`, `Bittrex.dll`):
+   ```powershell
+   Copy-Item target\release\liquidzorro.dll "<ZorroFolder>\Plugin64\Hyperliquid.dll"
+   ```
+   Zorro64 (the 64-bit executable) loads plugins from `Plugin64\`; the 32-bit `Zorro.exe` uses `Plugin\` instead and would need a 32-bit build, which this project doesn't target.
+3. **Launch `Zorro64.exe`.** At startup it scans `Plugin64\` and calls `BrokerOpen` on every DLL there to learn each plugin's display name -- ours reports `"Hyperliquid"`, which will appear alongside the stock brokers (Oanda, FXCM, Bittrex, etc.) in the **Broker** dropdown on the main window.
+4. **Select "Hyperliquid" in the Broker dropdown.** Zorro's login panel exposes a **User** field, a **Password** field, and a **Demo/Real** toggle (the same panel every broker plugin uses -- there's no plugin-specific custom UI).
+   - Leave **User** blank (there's no separate "API key" concept for a raw EVM wallet).
+   - Put the Hyperliquid private key (`0x...`) in **Password**.
+   - **Demo** logs into Hyperliquid testnet; **Real** logs into Hyperliquid mainnet -- this switch is read directly by `BrokerLogin` (see `src/ffi.rs`), so flipping it in the UI is the whole mechanism, no config file edit needed. Start with **Demo** every time until mainnet behavior has been deliberately verified.
+5. **Trigger login** (e.g. by entering Trade or Test mode, or via Zorro's explicit login control, depending on your Zorro version) and watch the message/log window -- that's where our `fpError` callback surfaces anything `BrokerLogin` reports, success or failure.
+6. **Configure an asset.** `BrokerAsset` is only ever called for symbols Zorro's asset list or running script actually references, so a Hyperliquid pair (e.g. `PURR/USDC`) needs to exist in whatever `.csv` asset list the session uses before prices will flow -- this project doesn't ship one yet.
+
+A successful login populates Zorro's Account box from whatever `BrokerLogin` writes to its `Accounts` output parameter; we don't populate that yet, so expect it to show blank/default until that's wired up.

@@ -65,7 +65,7 @@ fn flatten_base_balance(plugin: &state::PluginState, pair_name: &str, base_token
 #[test]
 #[ignore]
 fn connects_and_reads_market_data() {
-    login().expect("login should succeed");
+    login(None, BaseUrl::Testnet).expect("login should succeed");
     let plugin = state::get().expect("state should be initialized after login");
     let (pair, _) = test_pair(plugin);
     println!("testing against {pair}");
@@ -95,7 +95,7 @@ fn connects_and_reads_market_data() {
 #[test]
 #[ignore]
 fn places_and_closes_a_spot_order() {
-    login().expect("login should succeed");
+    login(None, BaseUrl::Testnet).expect("login should succeed");
     let plugin = state::get().unwrap();
     let (pair, base_token) = test_pair(plugin);
 
@@ -146,7 +146,7 @@ fn places_and_closes_a_spot_order() {
 #[test]
 #[ignore]
 fn flattens_leftover_balance() {
-    login().expect("login should succeed");
+    login(None, BaseUrl::Testnet).expect("login should succeed");
     let plugin = state::get().unwrap();
     let (pair, base_token) = test_pair(plugin);
 
