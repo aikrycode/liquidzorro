@@ -133,3 +133,45 @@ fn ole_to_unix_millis(ole: f64) -> i64 {
 fn unix_millis_to_ole(unix_millis: i64) -> f64 {
     unix_millis as f64 / 86_400_000.0 + 25569.0
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Live Phase 2 smoke test against Hyperliquid testnet. Ignored by
+    /// default since it needs network + HL_TESTNET_PRIVKEY; run explicitly
+    /// with `cargo test -- --ignored --nocapture`. Everything it calls
+    /// (login/spot_meta/all_mids/candles_snapshot) is a read-only info
+    /// endpoint -- no orders are placed, so it never spends testnet USDC.
+    #[test]
+    #[ignore]
+    fn login_and_query_testnet() {
+        login().expect("login should succeed");
+        let plugin = state::get().expect("state should be initialized after login");
+
+        let spot_meta = runtime::get()
+            .block_on(plugin.info_client.spot_meta())
+            .expect("spot_meta should succeed");
+        let pair = spot_meta
+            .universe
+            .first()
+            .expect("testnet should have at least one spot pair")
+            .name
+            .clone();
+        println!("first spot pair from spot_meta universe: {pair}");
+
+        let price = asset_price(&pair);
+        println!("{pair} price via all_mids: {price:?}");
+        assert!(price.is_some(), "expected a price for {pair} from all_mids");
+
+        let now_ole = unix_millis_to_ole(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as i64,
+        );
+        let candles = history(&pair, now_ole, 60, 5);
+        println!("{pair} last 5 hourly candles: {candles:?}");
+        assert!(candles.is_some(), "expected candle history for {pair}");
+    }
+}
