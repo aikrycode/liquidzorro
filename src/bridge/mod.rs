@@ -59,10 +59,20 @@ pub fn login(privkey: Option<&str>, base_url: BaseUrl) -> Result<(), String> {
     Ok(())
 }
 
+/// `BrokerBuy2`'s `Amount` is a plain C `int`, so it can't represent a
+/// fractional base-asset quantity directly -- useless for anything priced
+/// like BTC, where even $25 is a tiny fraction of 1 BTC and would round to
+/// 0. Instead, `Amount` here counts whole units of `1 / AMOUNT_SCALE` of
+/// the base asset (0.00001 by default), and the companion Zorro script
+/// declares `vLotAmount = 1` in `assetAdd` so `Lots` passes straight
+/// through as this same sub-unit count.
+pub const AMOUNT_SCALE: f64 = 100_000.0;
+
 /// Places a market order if `limit` is `0.0`, otherwise a resting (GTC) limit
 /// order. `amount > 0` buys, `amount < 0` sells -- there is no separate close
 /// export in Zorro's ABI, so `BrokerBuy2`'s sign is the only signal we get.
-/// Returns `(zorro_trade_id, fill_price, fill_amount)`.
+/// `amount` and the returned fill amount are in `AMOUNT_SCALE` sub-units;
+/// returns `(zorro_trade_id, fill_price, fill_amount)`.
 ///
 /// TODO: `stop_dist` (StopDist) isn't wired to a Hyperliquid trigger order
 /// yet; Zorro can still manage the stop client-side by calling BrokerBuy2
@@ -73,7 +83,7 @@ pub fn place_order(symbol: &str, amount: i32, limit: f64) -> Result<(i32, f64, i
         return Err("amount must be nonzero".to_string());
     }
     let is_buy = amount > 0;
-    let sz = amount.unsigned_abs() as f64;
+    let sz = amount.unsigned_abs() as f64 / AMOUNT_SCALE;
 
     let response = runtime::get().block_on(async {
         // The SDK's own `market_open` helper only looks up sz_decimals/mid
@@ -121,7 +131,7 @@ pub fn place_order(symbol: &str, amount: i32, limit: f64) -> Result<(i32, f64, i
             let price: f64 = order.avg_px.parse().unwrap_or(limit.max(0.0));
             let fill_sz: f64 = order.total_sz.parse().unwrap_or(sz);
             let zorro_id = state::register_trade(symbol, order.oid, is_buy, price, fill_sz);
-            Ok((zorro_id, price, fill_sz.round() as i32))
+            Ok((zorro_id, price, (fill_sz * AMOUNT_SCALE).round() as i32))
         }
         ExchangeDataStatus::Resting(order) => {
             let zorro_id = state::register_trade(symbol, order.oid, is_buy, limit, sz);
@@ -201,14 +211,17 @@ pub fn trade_status(zorro_id: i32) -> Option<(f64, f64, f64, f64, i32)> {
     let direction = if info.is_buy { 1.0 } else { -1.0 };
     let profit = direction * (close_price - info.entry_price) * info.entry_sz;
 
+    // fill_state crosses back into Zorro's Amount domain, so it's in
+    // AMOUNT_SCALE sub-units like BrokerBuy2's fill_amount, not real
+    // base-asset quantity.
     let fill_state = match status.order {
         None => -1, // Hyperliquid no longer tracks this order -> treat as closed
         Some(order_info) => match order_info.status.as_str() {
-            "filled" => info.entry_sz.round() as i32,
+            "filled" => (info.entry_sz * AMOUNT_SCALE).round() as i32,
             "canceled" | "rejected" | "marginCanceled" => NAY - 1,
             _ => {
                 let remaining: f64 = order_info.order.sz.parse().unwrap_or(info.entry_sz);
-                (info.entry_sz - remaining).max(0.0).round() as i32
+                ((info.entry_sz - remaining).max(0.0) * AMOUNT_SCALE).round() as i32
             }
         },
     };
