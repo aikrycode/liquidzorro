@@ -1,0 +1,3 @@
+# Sponsor button target. `custom` must be an https URL -- a bare wallet
+# address is accepted silently and renders a broken button.
+custom: ["https://github.com/aikrycode/liquidzorro#support"]
