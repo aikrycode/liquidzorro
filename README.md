@@ -139,7 +139,7 @@ Accepts **ETH or USDC** on **Ethereum, Arbitrum, Base and Optimism**. Please don
 
 Donations are voluntary gifts. They buy no warranty, no support obligation, no priority on issues, and no influence over the roadmap; the disclaimer at the top of this README and the licence terms apply unchanged. Nothing here is an investment, and no return of any kind is offered or implied.
 
-Before sending, check the commit history for this line -- the address changes only in a deliberate commit, never silently. The project will never ask you for funds or for a private key through issues, pull requests, or direct messages.
+This address only ever changes in a signed commit -- before sending, check that the commit which last touched it shows as **Verified** on GitHub. The project will never ask you for funds or for a private key through issues, pull requests, or direct messages.
 
 ## Known Issues
 
