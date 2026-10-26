@@ -73,7 +73,7 @@ With `HL_TESTNET_PRIVKEY` set (step 7 above), the `#[ignore]`d tests in `src/bri
 cargo test --lib -- --ignored --nocapture
 ```
 
-`connects_and_reads_market_data` is read-only (spot_meta/all_mids/candles_snapshot) and never spends anything. `places_and_closes_a_spot_order` places and immediately closes an order sized just above Hyperliquid's $10 minimum notional, sweeping any partial-fill leftover afterward -- it does spend a little testnet USDC, but only slippage is lost (a few cents), since the round trip returns the rest. `flattens_leftover_balance` is a standalone cleanup if a prior run ever leaves a position open. All three need a funded testnet wallet per the steps above.
+`connects_and_reads_market_data` is read-only (spot_meta/all_mids/candles_snapshot) and never spends anything. `logout_then_login_reconnects` checks that logging out actually drops the session and the next login reconnects -- also read-only. `places_and_closes_a_spot_order` places and immediately closes an order sized just above Hyperliquid's $10 minimum notional, sweeping any partial-fill leftover afterward -- it does spend a little testnet USDC, but only slippage is lost (a few cents), since the round trip returns the rest. `flattens_leftover_balance` is a standalone cleanup if a prior run ever leaves a position open. All need a funded testnet wallet per the steps above.
 
 ## Installing and running inside Zorro
 
@@ -92,18 +92,21 @@ cargo test --lib -- --ignored --nocapture
 3. **Launch Zorro.** It scans the plugin folder and calls `BrokerOpen` on each DLL to learn its display name -- ours reports `"Hyperliquid"`, shown in the **Broker** dropdown.
 4. **Select "Hyperliquid".** User: blank. Password: your private key (`0x...`). Demo/Real toggle selects testnet/mainnet directly via `BrokerLogin` -- start with Demo.
 5. **Trigger login** (enter Trade or Test mode) and watch the message window -- that's where `BrokerLogin` reports success or failure.
-6. **Asset list.** `History\AssetsHyperliquid.csv` + `History\Accounts.csv` (in `examples\`) point Hyperliquid's accounts at a dedicated asset list instead of the generic default.
+6. **Asset list.** `History\AssetsHyperliquid.csv` + `History\Accounts.csv` (in `examples\`) point Hyperliquid's accounts at a dedicated asset list instead of the generic default. `Accounts.csv`'s `NFA` column is `14` (not `0`) -- matching Zorro's own working examples (IB, Binance); `0` intermittently blocked closing trades with "Error 075 - closing not supported (NFA?)" even with the script's own `set(NFA|OFF)`.
+7. **`Zorro.ini`: set `AutoConfirm = 1`** (requires a restart, like any `Zorro.ini` change). Without it, `[Stop]` prompts to close open trades and, on confirming, tries to auto-close them through Zorro's own close machinery -- which hits the same NFA-style restriction and fails with repeated `Error 075`. The demo script already flattens its own position before finishing a normal run, so Zorro's separate auto-close isn't needed.
+
+The plugin DLL stays loaded across a `[Stop]`/`[Trade]` cycle, so its session outlives the script. `BrokerLogin(NULL, ...)` (Zorro's logout) drops that session and the next login reconnects from scratch, which is what makes it safe to change the key or flip Demo/Real between runs without restarting Zorro.
 
 ### Demo strategy walkthrough
 
 `examples/HyperliquidBuySellDemo.c` (32-bit Lite-C) / `HyperliquidBuySellDemo+.cpp` (64-bit, needs external compilation -- see its header) is a linear state machine, advancing one step per `run()` call (~once a minute, since `BarPeriod = 1`):
 
-- **Setup:** `set(NFA|OFF)` (else `exitLong` fails with "Error 075"), `SaveMode = 0` (avoids Zorro resuming a trade id our plugin no longer remembers after a restart). `!is(TRADEMODE)` refuses Test/Train.
-- **`Step == -1`:** checks `GET_POSITION` (the plugin's real Hyperliquid balance, not Zorro's local trade list) -- if it's above `DUST_THRESHOLD_LOTS`, resumes straight into selling instead of buying again (sets `Resuming`); smaller amounts are logged and ignored, since they tend to round to zero at the asset's real size precision and get rejected rather than sold.
+- **Setup:** `set(NFA|OFF)`, `SaveMode = 0` (avoids Zorro resuming a trade id our plugin no longer remembers after a restart), `Hedge = 2` (see below). `!is(TRADEMODE)` refuses Test/Train.
+- **`Step == -1`:** checks `GET_POSITION` (the plugin's real Hyperliquid balance, not Zorro's local trade list) -- if it's above `DUST_THRESHOLD_LOTS`, resumes straight into selling instead of buying again; smaller amounts are logged and ignored, since they tend to round to zero at the asset's real size precision and get rejected rather than sold.
 - **`Step == 0`:** waits for a live price, sizes `Lots` from `USD_AMOUNT`, `enterLong()`.
 - **`Step == 1`:** waits for the fill, splits the total into `Lots1`/`Lots2`.
-- **`Step == 2`/`3`:** sells each half. A resumed position has no Zorro trade object for `exitLong` to act on (it would silently no-op), so `Resuming` makes these use `enterShort()` instead, which always places a real order. Neither print claims success -- the plugin's own `BrokerBuy2` OK/FAILED log line is the accurate record.
-- **`Step == 4`:** IOC sells can partially fill, so this re-checks `GET_POSITION` once and sweeps anything above the dust threshold via `enterShort()`.
+- **`Step == 2`/`3`:** sells each half via `sellViaShort()`, a helper around `enterShort()` (Hyperliquid spot has no real shorting, so to the plugin this is just "sell this much"). `exitLong` is never used: it goes through Zorro's close machinery, which this broker can't satisfy ("Error 075 - closing not supported"). `enterShort()` alone is not enough either -- at Zorro's default `Hedge = 0` a short against an open long is treated as a *reversal*, which re-enters that same close path and fails with "Reverse - can't close". `Hedge = 2` (full hedging: long and short may be open simultaneously) makes the sell a plain independent order. Zorro then records each sell as an open short position, which is why step 7 above disables its auto-close. Neither print claims success -- the plugin's own `BrokerBuy2` OK/FAILED log line is the accurate record.
+- **`Step == 4`:** IOC sells can partially fill, so this re-checks `GET_POSITION` once and sweeps anything above the dust threshold via `sellViaShort()`.
 - **`AMOUNT_SCALE` (100000):** `Amount` is a plain C `int`, can't hold a fraction of a unit -- `Lots` counts `1/AMOUNT_SCALE` sub-units instead, matching `bridge::AMOUNT_SCALE` and the CSV's `LotAmount` column.
 
 ## Known Issues
