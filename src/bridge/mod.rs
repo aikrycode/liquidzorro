@@ -18,7 +18,9 @@ use crate::{runtime, state};
 const TESTNET_PRIVKEY_ENV: &str = "HL_TESTNET_PRIVKEY";
 
 /// Logs in with `privkey` (falls back to `HL_TESTNET_PRIVKEY` for dev use)
-/// against `base_url`. Stores the clients in `state`; returns the address.
+/// against `base_url`. Replaces any previous session, so a `[Stop]` /
+/// `[Trade]` cycle within one Zorro process reconnects with whatever
+/// credentials and network are set at that point.
 pub fn login(privkey: Option<&str>, base_url: BaseUrl) -> Result<alloy::primitives::Address, String> {
     let privkey = match privkey {
         Some(k) if !k.is_empty() => k.to_string(),
@@ -45,9 +47,7 @@ pub fn login(privkey: Option<&str>, base_url: BaseUrl) -> Result<alloy::primitiv
         Ok::<_, String>((info_client, exchange_client))
     })?;
 
-    if !state::init(info_client, exchange_client, address) {
-        return Err("already logged in".to_string());
-    }
+    state::init(info_client, exchange_client, address);
     Ok(address)
 }
 
