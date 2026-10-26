@@ -48,6 +48,7 @@ int Cycle;
 int Passed, Failed;
 var Chunk1, Chunk2, Chunk3;
 var StartBalance;
+var PositionBeforeBuy;
 var PositionBeforeReject;
 int LimitTradeID;
 int LimitPollsLeft;
@@ -166,6 +167,7 @@ function run()
 
 		brokerCommand(CMD_SET_ORDERTYPE, ORDERTYPE_IOC);
 		OrderLimit = 0;                        // market order
+		PositionBeforeBuy = heldLots();        // so the fill check measures this buy
 		Lots = ceil(TRADE_USD/Price*AMOUNT_SCALE);
 		enterLong();
 		printf("\n[cycle %d] buy submitted: %.0f lots (~$%d)", Cycle+1, Lots, TRADE_USD);
@@ -175,7 +177,9 @@ function run()
 
 	if(Phase == PH_AWAIT_FILL) {
 		var Held = heldLots();
-		check("Market buy reaches the exchange", Held > DUST_THRESHOLD_LOTS);
+		// measured against the pre-buy position, so a leftover balance from
+		// an earlier run can't make a failed buy look successful
+		check("Market buy reaches the exchange", Held > PositionBeforeBuy);
 		if(Held <= DUST_THRESHOLD_LOTS) {      // nothing to sell; skip to next cycle
 			Phase = PH_CYCLE_END;
 			return;
@@ -244,7 +248,11 @@ function run()
 	if(Phase == PH_LIMIT_POLL) {
 		int Pending = 0;
 		for(open_trades) {
-			if(TradeIsPending) {
+			// An accepted-but-unfilled order is a trade holding zero lots.
+			// Zorro doesn't reliably flag it TradeIsPending, so match on
+			// the lot count too -- missing it strands a live order on the
+			// exchange holding collateral.
+			if(TradeIsPending || TradeLots == 0) {
 				Pending++;
 				LimitTradeID = TradeID;
 			}
@@ -290,8 +298,22 @@ function run()
 	}
 
 	if(Phase == PH_REPORT) {
-		var EndBalance = Balance;
-		var Held = heldLots();
+		var EndBalance, Held;
+		int Stranded = 0;
+
+		// Safety net: never leave a resting order behind holding collateral,
+		// whatever happened in the limit phase above.
+		for(open_trades) {
+			if(TradeLots == 0) {
+				printf("\nCancelling stranded order, trade id %d", TradeID);
+				brokerCommand(CMD_DO_CANCEL, TradeID);
+				Stranded++;
+			}
+		}
+		check("No resting orders left behind", Stranded == 0);
+
+		EndBalance = Balance;
+		Held = heldLots();
 
 		check("Undersized order left the position unchanged",
 			abs(Held - PositionBeforeReject) <= DUST_THRESHOLD_LOTS);
