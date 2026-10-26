@@ -14,9 +14,7 @@ use hyperliquid_rust_sdk::{ExchangeClient, InfoClient};
 pub type ErrorFn = unsafe extern "C" fn(*const c_char) -> c_int;
 pub type ProgressFn = unsafe extern "C" fn(c_int) -> c_int;
 
-/// Bookkeeping for one order placed via `BrokerBuy2`, keyed by the Zorro
-/// trade id we made up (Hyperliquid's own `oid` isn't guaranteed to fit
-/// Zorro's expectations, and Zorro needs a stable id to query back later).
+/// Bookkeeping for one order, keyed by the Zorro trade id we made up.
 #[derive(Clone)]
 pub struct TradeInfo {
     pub coin: String,
@@ -35,12 +33,12 @@ pub struct PluginState {
 
 static CALLBACKS: OnceLock<Callbacks> = OnceLock::new();
 static PLUGIN: OnceLock<PluginState> = OnceLock::new();
-// Zorro's manual asks for a "6-digit minimum" trade id, so start comfortably above that.
+// Zorro wants a 6-digit-minimum trade id.
 static NEXT_TRADE_ID: AtomicI32 = AtomicI32::new(100_000);
 
 struct Callbacks {
     error: Option<ErrorFn>,
-    #[allow(dead_code)] // wired up once BrokerBuy2/BrokerHistory2 report long-running progress
+    #[allow(dead_code)] // wired up once long-running calls report progress
     progress: Option<ProgressFn>,
 }
 
@@ -48,14 +46,9 @@ pub fn set_callbacks(error: Option<ErrorFn>, progress: Option<ProgressFn>) {
     let _ = CALLBACKS.set(Callbacks { error, progress });
 }
 
-/// Reports a message back to Zorro via the `fpError` callback from `BrokerOpen`.
-/// Despite the name Zorro gave this callback, real plugins (Simulation.cpp,
-/// Bittrex.cpp) use it for ordinary status messages too, not just errors --
-/// it's the only channel back to Zorro's message window, so every
-/// significant step (login success/failure, orders, lookups that fail)
-/// should go through here for visibility. Falls back to stderr if the
-/// plugin hasn't been opened yet (shouldn't happen -- Zorro always calls
-/// BrokerOpen first).
+/// Reports a message via the `fpError` callback -- real plugins use this
+/// for ordinary status too, not just errors; it's the only channel to
+/// Zorro's message window. Falls back to stderr if not yet opened.
 pub fn log_message(msg: &str) {
     match CALLBACKS.get().and_then(|c| c.error) {
         Some(cb) => {
@@ -71,9 +64,7 @@ pub fn get() -> Option<&'static PluginState> {
     PLUGIN.get()
 }
 
-/// Stores the logged-in clients. Returns `false` if already logged in
-/// (Zorro is not expected to call BrokerLogin twice without an intervening
-/// logout, so this just guards against double-init rather than replacing).
+/// Stores the logged-in clients. `false` if already logged in.
 pub fn init(
     info_client: InfoClient,
     exchange_client: ExchangeClient,
@@ -89,13 +80,11 @@ pub fn init(
         .is_ok()
 }
 
-/// Records a newly placed order and hands back the Zorro-facing trade id for it.
+/// Records a newly placed order, returns the Zorro-facing trade id.
 pub fn register_trade(coin: &str, oid: u64, is_buy: bool, entry_price: f64, entry_sz: f64) -> i32 {
     let id = NEXT_TRADE_ID.fetch_add(1, Ordering::Relaxed);
     if let Some(plugin) = get() {
-        // Recover from poisoning rather than cascading a panic: a previous
-        // panic while the lock was held shouldn't make every future trade
-        // lookup through the FFI boundary panic too.
+        // recover from poisoning instead of cascading a panic
         plugin
             .trades
             .lock()

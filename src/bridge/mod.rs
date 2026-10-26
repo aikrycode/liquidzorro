@@ -1,12 +1,8 @@
-//! Sync-to-async bridge between Zorro's blocking FFI calls and the async
-//! hyperliquid_rust_sdk clients. Each call here does a short `block_on` over
-//! a REST request.
+//! Sync-to-async bridge: each call does a short `block_on` over a REST
+//! request against the hyperliquid_rust_sdk clients.
 //!
-//! TODO: BrokerAsset currently does one `all_mids` REST round-trip per call.
-//! Zorro polls BrokerAsset per-asset at TickTime intervals, so once this is
-//! tested against a live Zorro session this should move to a WS `AllMids`
-//! subscription feeding a mutex-protected cache instead, so polling never
-//! blocks on the network.
+//! TODO: BrokerAsset does one REST round-trip per call; move to a cached
+//! WS `AllMids` subscription once polling performance needs it.
 
 use std::env;
 
@@ -21,12 +17,8 @@ use crate::{runtime, state};
 
 const TESTNET_PRIVKEY_ENV: &str = "HL_TESTNET_PRIVKEY";
 
-/// Logs into Hyperliquid using `privkey` (from Zorro's Password field --
-/// falling back to `HL_TESTNET_PRIVKEY` only if that field is empty, for our
-/// own test convenience) against `base_url` (selected by Zorro's Real/Demo
-/// toggle: Demo -> testnet, Real -> mainnet). Stores the resulting clients
-/// in `state`, and returns the wallet address on success so `BrokerLogin`
-/// can report it via `state::log_message`.
+/// Logs in with `privkey` (falls back to `HL_TESTNET_PRIVKEY` for dev use)
+/// against `base_url`. Stores the clients in `state`; returns the address.
 pub fn login(privkey: Option<&str>, base_url: BaseUrl) -> Result<alloy::primitives::Address, String> {
     let privkey = match privkey {
         Some(k) if !k.is_empty() => k.to_string(),
@@ -45,7 +37,7 @@ pub fn login(privkey: Option<&str>, base_url: BaseUrl) -> Result<alloy::primitiv
         let exchange_client = ExchangeClient::new(None, wallet, Some(base_url), None, None)
             .await
             .map_err(|e| format!("ExchangeClient connect failed: {e}"))?;
-        // Sanity-check connectivity before reporting a successful login.
+        // sanity-check connectivity
         info_client
             .spot_meta()
             .await
@@ -59,37 +51,32 @@ pub fn login(privkey: Option<&str>, base_url: BaseUrl) -> Result<alloy::primitiv
     Ok(address)
 }
 
-/// `BrokerBuy2`'s `Amount` is a plain C `int`, so it can't represent a
-/// fractional base-asset quantity directly -- useless for anything priced
-/// like BTC, where even $25 is a tiny fraction of 1 BTC and would round to
-/// 0. Instead, `Amount` here counts whole units of `1 / AMOUNT_SCALE` of
-/// the base asset (0.00001 by default), and the companion Zorro script
-/// declares `vLotAmount = 1` in `assetAdd` so `Lots` passes straight
-/// through as this same sub-unit count.
+/// `Amount` is a plain C `int`, so it can't hold a fraction of a base-asset
+/// unit (e.g. BTC). Instead it counts `1/AMOUNT_SCALE`-sized sub-units; the
+/// Zorro script mirrors this via its own AMOUNT_SCALE constant.
 pub const AMOUNT_SCALE: f64 = 100_000.0;
 
-/// Places a market order if `limit` is `0.0`, otherwise a resting (GTC) limit
-/// order. `amount > 0` buys, `amount < 0` sells -- there is no separate close
-/// export in Zorro's ABI, so `BrokerBuy2`'s sign is the only signal we get.
-/// `amount` and the returned fill amount are in `AMOUNT_SCALE` sub-units;
-/// returns `(zorro_trade_id, fill_price, fill_amount)`.
+/// Market order if `limit == 0.0`, else a resting GTC limit order. Positive
+/// `amount` buys, negative sells (no separate close export). Returns
+/// `(zorro_trade_id, fill_price, fill_amount)`, all in `AMOUNT_SCALE` units.
 ///
-/// TODO: `stop_dist` (StopDist) isn't wired to a Hyperliquid trigger order
-/// yet; Zorro can still manage the stop client-side by calling BrokerBuy2
-/// again with a negative amount, so this isn't blocking for v1.
+/// TODO: `stop_dist` isn't wired to a Hyperliquid trigger order yet.
 pub fn place_order(symbol: &str, amount: i32, limit: f64) -> Result<(i32, f64, i32), String> {
     let plugin = state::get().ok_or("not logged in")?;
     if amount == 0 {
         return Err("amount must be nonzero".to_string());
     }
     let is_buy = amount > 0;
-    let sz = amount.unsigned_abs() as f64 / AMOUNT_SCALE;
+    let raw_sz = amount.unsigned_abs() as f64 / AMOUNT_SCALE;
 
-    let response = runtime::get().block_on(async {
-        // The SDK's own `market_open` helper only looks up sz_decimals/mid
-        // price in the perp universe (`meta()`), so it 404s with
-        // "Asset not found" for any spot pair -- build the IOC limit order
-        // against spot_meta() ourselves instead for a "market" order.
+    let (sz, response) = runtime::get().block_on(async {
+        // round to the asset's real size precision, or Hyperliquid rejects
+        // the order ("Order has invalid size")
+        let sz_decimals = spot_sz_decimals(&plugin.info_client, symbol).await?;
+        let sz = round_to_decimals(raw_sz, sz_decimals);
+
+        // SDK's market_open() only checks the perp universe for price, 404s
+        // on spot pairs -- build the IOC limit order against spot_meta() ourselves
         let (limit_px, tif) = if limit > 0.0 {
             (limit, "Gtc")
         } else {
@@ -110,11 +97,12 @@ pub fn place_order(symbol: &str, amount: i32, limit: f64) -> Result<(i32, f64, i
                 tif: tif.to_string(),
             }),
         };
-        plugin
+        let response = plugin
             .exchange_client
             .order(order, None)
             .await
-            .map_err(|e| format!("order request failed: {e}"))
+            .map_err(|e| format!("order request failed: {e}"))?;
+        Ok::<_, String>((sz, response))
     })?;
 
     let exchange_response = match response {
@@ -142,17 +130,8 @@ pub fn place_order(symbol: &str, amount: i32, limit: f64) -> Result<(i32, f64, i
     }
 }
 
-/// Slippage-adjusted limit price for an IOC "market" order on a spot pair,
-/// mirroring the private rounding rule `ExchangeClient::market_open` uses
-/// internally (5 significant figures, then `8 - base_token.sz_decimals`
-/// decimal places) -- but looked up against `spot_meta()` so it actually
-/// works for spot pairs instead of only perps.
-async fn marketable_spot_price(
-    info: &InfoClient,
-    symbol: &str,
-    is_buy: bool,
-    slippage: f64,
-) -> Result<f64, String> {
+/// Decimal places Hyperliquid allows for order sizes on `symbol`'s base asset.
+async fn spot_sz_decimals(info: &InfoClient, symbol: &str) -> Result<u32, String> {
     let spot_meta = info
         .spot_meta()
         .await
@@ -167,7 +146,19 @@ async fn marketable_spot_price(
         .iter()
         .find(|t| t.index == asset.tokens[0])
         .ok_or_else(|| format!("base token for {symbol} not found"))?;
-    let price_decimals = 8u32.saturating_sub(base_token.sz_decimals as u32);
+    Ok(base_token.sz_decimals as u32)
+}
+
+/// Slippage-adjusted limit price for an IOC "market" order, rounded to 5
+/// significant figures / `8 - sz_decimals` decimals (mirrors the SDK's
+/// private rule, but via `spot_meta()` so it works for spot pairs too).
+async fn marketable_spot_price(
+    info: &InfoClient,
+    symbol: &str,
+    is_buy: bool,
+    slippage: f64,
+) -> Result<f64, String> {
+    let price_decimals = 8u32.saturating_sub(spot_sz_decimals(info, symbol).await?);
 
     let mids = info
         .all_mids()
@@ -196,10 +187,8 @@ fn round_to_significant_and_decimal(value: f64, sig_figs: u32, max_decimals: u32
     round_to_decimals(rounded.copysign(value), max_decimals)
 }
 
-/// Polls Hyperliquid for the current state of a previously placed order.
-/// Returns `(open_price, close_price, cost, profit, fill_state)` where
-/// `fill_state` follows Zorro's BrokerTrade contract (filled lots, or the
-/// `-1`/`NAY-1` sentinels for closed/cancelled).
+/// Status of a previously placed order: `(open_price, close_price, cost,
+/// profit, fill_state)`; `fill_state` follows BrokerTrade's contract.
 pub fn trade_status(zorro_id: i32) -> Option<(f64, f64, f64, f64, i32)> {
     let plugin = state::get()?;
     let info = state::get_trade(zorro_id)?;
@@ -211,11 +200,9 @@ pub fn trade_status(zorro_id: i32) -> Option<(f64, f64, f64, f64, i32)> {
     let direction = if info.is_buy { 1.0 } else { -1.0 };
     let profit = direction * (close_price - info.entry_price) * info.entry_sz;
 
-    // fill_state crosses back into Zorro's Amount domain, so it's in
-    // AMOUNT_SCALE sub-units like BrokerBuy2's fill_amount, not real
-    // base-asset quantity.
+    // fill_state is in AMOUNT_SCALE sub-units, like BrokerBuy2's fill_amount
     let fill_state = match status.order {
-        None => -1, // Hyperliquid no longer tracks this order -> treat as closed
+        None => -1, // no longer tracked -> treat as closed
         Some(order_info) => match order_info.status.as_str() {
             "filled" => (info.entry_sz * AMOUNT_SCALE).round() as i32,
             "canceled" | "rejected" | "marginCanceled" => NAY - 1,
@@ -229,9 +216,8 @@ pub fn trade_status(zorro_id: i32) -> Option<(f64, f64, f64, f64, i32)> {
     Some((info.entry_price, close_price, 0.0, profit, fill_state))
 }
 
-/// `(balance, trade_val, margin_val)` for `BrokerAccount`, sourced from the
-/// USDC row of `user_token_balances`. Spot has no margin, so `margin_val` is
-/// always `0.0`; `trade_val` is USDC currently locked in resting orders.
+/// `(balance, trade_val, margin_val)` for `BrokerAccount`. Spot has no
+/// margin; `trade_val` is USDC locked in resting orders.
 pub fn account_balance() -> Option<(f64, f64, f64)> {
     let plugin = state::get()?;
     let resp = runtime::get()
@@ -243,8 +229,31 @@ pub fn account_balance() -> Option<(f64, f64, f64)> {
     Some((total, hold, 0.0))
 }
 
-/// Last ask price for `symbol` (a Hyperliquid spot coin name, e.g. "PURR/USDC"),
-/// via a REST `all_mids` call.
+/// Actual held base-asset quantity for `symbol`, from Hyperliquid directly
+/// (not Zorro's process-local trade bookkeeping). Backs GET_POSITION.
+/// `0.0` (not `None`) for "no position".
+pub fn net_position(symbol: &str) -> Option<f64> {
+    let plugin = state::get()?;
+    let spot_meta = runtime::get().block_on(plugin.info_client.spot_meta()).ok()?;
+    let asset = spot_meta.universe.iter().find(|a| a.name == symbol)?;
+    let base_token = spot_meta
+        .tokens
+        .iter()
+        .find(|t| t.index == asset.tokens[0])?;
+    let balances = runtime::get()
+        .block_on(plugin.info_client.user_token_balances(plugin.address))
+        .ok()?;
+    Some(
+        balances
+            .balances
+            .iter()
+            .find(|b| b.coin == base_token.name)
+            .and_then(|b| b.total.parse::<f64>().ok())
+            .unwrap_or(0.0),
+    )
+}
+
+/// Last ask price for `symbol` via `all_mids`.
 pub fn asset_price(symbol: &str) -> Option<f64> {
     let plugin = state::get()?;
     let mids = runtime::get()
@@ -253,9 +262,7 @@ pub fn asset_price(symbol: &str) -> Option<f64> {
     mids.get(symbol)?.parse().ok()
 }
 
-/// Historical candles for `symbol`, most recent first, matching Zorro's
-/// BrokerHistory2 contract. `n_tick_minutes` is mapped to the closest
-/// Hyperliquid candle interval Hyperliquid supports.
+/// Historical candles for `symbol`, newest first (BrokerHistory2 contract).
 pub fn history(symbol: &str, end_ole: f64, n_tick_minutes: i32, n_ticks: i32) -> Option<Vec<T6>> {
     let plugin = state::get()?;
     let interval = interval_for_minutes(n_tick_minutes);
@@ -271,8 +278,7 @@ pub fn history(symbol: &str, end_ole: f64, n_tick_minutes: i32, n_ticks: i32) ->
         )
         .ok()?;
 
-    // Hyperliquid returns candles oldest-first; Zorro expects newest-first.
-    candles.sort_by_key(|c| std::cmp::Reverse(c.time_open));
+    candles.sort_by_key(|c| std::cmp::Reverse(c.time_open)); // oldest-first -> newest-first
     candles.truncate(n_ticks.max(0) as usize);
     Some(candles.into_iter().map(candle_to_t6).collect())
 }
@@ -290,8 +296,7 @@ fn candle_to_t6(c: CandlesSnapshotResponse) -> T6 {
     }
 }
 
-/// Picks the Hyperliquid candle interval closest to (but not finer than)
-/// Zorro's requested bar length.
+/// Closest Hyperliquid candle interval not finer than the requested bar length.
 fn interval_for_minutes(minutes: i32) -> &'static str {
     const STEPS: &[(i32, &str)] = &[
         (1, "1m"),
@@ -314,8 +319,7 @@ fn interval_for_minutes(minutes: i32) -> &'static str {
         .unwrap_or("1m")
 }
 
-/// OLE Automation date -> Unix epoch milliseconds. OLE day 0 is 1899-12-30;
-/// Unix epoch (1970-01-01) is 25569 OLE days later.
+/// OLE date -> Unix ms (OLE day 0 = 1899-12-30; epoch is 25569 days later).
 fn ole_to_unix_millis(ole: f64) -> i64 {
     ((ole - 25569.0) * 86_400_000.0).round() as i64
 }

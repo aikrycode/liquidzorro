@@ -1,15 +1,8 @@
-//! Zorro broker-plugin C ABI exports.
+//! Zorro broker-plugin C ABI exports, verified against a real `trading.h`
+//! and `Simulation.cpp` (Zorro S 2026).
 //!
-//! Signatures verified against `include\trading.h` and the real
-//! `Simulation.cpp` sample plugin from a Zorro S 2026 (build 3.1.1.2)
-//! install at `C:\Users\Matusovsky\Zorro2026`. See the plan file for the
-//! exact verbatim declarations this was checked against.
-//!
-//! Every exported function is wrapped in `guard()`: an unwinding Rust panic
-//! that reached across this `extern "C"` boundary would be undefined
-//! behavior inside Zorro's process, so any panic here is caught and turned
-//! into an ordinary failure return instead of risking a crash of the whole
-//! host application.
+//! Every export is wrapped in `guard()`: a panic crossing the FFI boundary
+//! is UB, so panics are caught and turned into a safe default return.
 
 use std::ffi::{c_void, CStr};
 use std::os::raw::{c_char, c_int};
@@ -17,14 +10,11 @@ use std::panic::{self, AssertUnwindSafe};
 
 use crate::{bridge, state};
 
-/// Zorro's `DATE`: an OLE automation date (days since 1899-12-30), not
-/// defined in trading.h itself — plugins declare it themselves.
+/// Zorro's `DATE`: OLE automation date, not defined in trading.h itself.
 pub type Date = f64;
 
-/// Candle with extra data, matching trading.h's `T6` exactly. No explicit
-/// `repr(packed)` needed: natural alignment and the lite-C side's
-/// `#pragma pack(push,4)` produce an identical 32-byte layout for this
-/// particular field set.
+/// trading.h's `T6`. No `repr(packed)` needed -- natural alignment already
+/// matches the lite-C side's `pack(4)` for this field set.
 #[repr(C)]
 #[derive(Debug)]
 pub struct T6 {
@@ -40,12 +30,10 @@ pub struct T6 {
 const PLUGIN_NAME: &[u8] = b"Hyperliquid\0";
 const PLUGIN_VERSION: c_int = 2;
 
-/// trading.h's `#define NAY -999997` sentinel, used by `BrokerTrade` for
-/// "no value"/"not available" style returns.
+/// trading.h's `NAY` sentinel ("no value"), used by `BrokerTrade`.
 pub const NAY: i32 = -999_997;
 
-/// Reads a Zorro-supplied `char*` argument as a `&str`, returning `None` for
-/// a null pointer or invalid UTF-8.
+/// Reads a Zorro `char*` as `&str`; `None` for null/invalid UTF-8.
 unsafe fn read_cstr<'a>(ptr: *const c_char) -> Option<&'a str> {
     if ptr.is_null() {
         return None;
@@ -53,8 +41,7 @@ unsafe fn read_cstr<'a>(ptr: *const c_char) -> Option<&'a str> {
     CStr::from_ptr(ptr).to_str().ok()
 }
 
-/// Runs `f`, catching any panic so it can't unwind across the FFI boundary.
-/// On panic, logs via `state::log_message` and returns `default` instead.
+/// Catches a panic from `f` and returns `default` instead of unwinding.
 fn guard<R>(label: &str, default: R, f: impl FnOnce() -> R) -> R {
     match panic::catch_unwind(AssertUnwindSafe(f)) {
         Ok(v) => v,
@@ -93,23 +80,18 @@ pub unsafe extern "C" fn BrokerLogin(
     _accounts: *mut c_char,
 ) -> c_int {
     guard("BrokerLogin", 0, || {
-        // Zorro calls BrokerLogin(NULL, ...) to log out; we hold no per-session
-        // resources worth tearing down yet, so just report success.
+        // NULL user = logout; nothing to tear down.
         if user.is_null() {
             state::log_message("Hyperliquid: logout requested");
             return 1;
         }
-        // Zorro's Password field holds the Hyperliquid private key (there's
-        // no separate "API key" concept for a raw EVM wallet, so the User
-        // field goes unused); its Real/Demo toggle selects mainnet/testnet.
+        // Password field = private key; Real/Demo toggle = mainnet/testnet.
         let privkey = read_cstr(pwd);
         let is_mainnet = matches!(read_cstr(kind), Some(k) if k.eq_ignore_ascii_case("real"));
         let base_url = if is_mainnet {
             hyperliquid_rust_sdk::BaseUrl::Mainnet
         } else {
-            // Default to testnet (including an unrecognized/missing Type)
-            // so an ambiguous login can never accidentally hit mainnet.
-            hyperliquid_rust_sdk::BaseUrl::Testnet
+            hyperliquid_rust_sdk::BaseUrl::Testnet // default: never land on mainnet by accident
         };
         state::log_message(&format!(
             "Hyperliquid: logging in ({})...",
@@ -171,17 +153,14 @@ pub unsafe extern "C" fn BrokerAsset(
             return 0;
         }
         let Some(price) = bridge::asset_price(symbol) else {
-            state::log_message(&format!(
-                "BrokerAsset({symbol}): price unavailable -- check the symbol matches Hyperliquid's spot_meta() exactly"
-            ));
+            state::log_message(&format!("BrokerAsset({symbol}): price unavailable"));
             return 0;
         };
 
         if !p_price.is_null() {
             *p_price = price;
         }
-        // Placeholders until spot_meta_and_asset_contexts() is wired in to supply
-        // real tick size / spread; Hyperliquid spot has no margin or rollover.
+        // Placeholders until spot_meta_and_asset_contexts() is wired in.
         if !p_spread.is_null() {
             *p_spread = 0.0;
         }
@@ -228,9 +207,7 @@ pub unsafe extern "C" fn BrokerHistory2(
             return 0;
         }
         let Some(candles) = bridge::history(symbol, t_end, n_tick_minutes, n_ticks) else {
-            state::log_message(&format!(
-                "BrokerHistory2({symbol}): candle history unavailable (not logged in, or bad symbol)"
-            ));
+            state::log_message(&format!("BrokerHistory2({symbol}): history unavailable"));
             return 0;
         };
         for (i, candle) in candles.iter().enumerate() {
@@ -276,9 +253,7 @@ pub unsafe extern "C" fn BrokerAccount(
     })
 }
 
-/// Positive `Amount` buys, negative sells/closes -- Zorro's ABI has no
-/// separate "sell"/"close" export, so the sign of `Amount` is the only
-/// signal `BrokerBuy2` gets.
+/// Positive `Amount` buys, negative sells -- no separate close export.
 #[no_mangle]
 pub unsafe extern "C" fn BrokerBuy2(
     asset: *mut c_char,
@@ -345,10 +320,34 @@ pub unsafe extern "C" fn BrokerTrade(
     })
 }
 
-/// TODO(Phase 4): GET_COMPLIANCE/GET_MAXREQUESTS/GET_BROKERZONE/GET_MAXTICKS/
-/// SET_SYMBOL/SET_ORDERTYPE, extended once we can see what a live Zorro64
-/// session actually requests.
+/// GET_COMPLIANCE: NFA-restriction query. `0` (default) made Zorro refuse
+/// `exitLong` ("Error 075"); both real sample plugins answer `2`, so do we.
+const GET_COMPLIANCE: c_int = 51;
+
+/// GET_POSITION: real held balance for the symbol in `parameter` (`char*`),
+/// read from Hyperliquid directly rather than Zorro's local (process-only)
+/// trade bookkeeping -- survives a full restart. AMOUNT_SCALE sub-units.
+const GET_POSITION: c_int = 53;
+
+/// TODO(Phase 4): remaining codes, once a live session shows what's needed.
 #[no_mangle]
-pub unsafe extern "C" fn BrokerCommand(_command: c_int, _parameter: isize) -> f64 {
-    guard("BrokerCommand", 0.0, || 0.0)
+pub unsafe extern "C" fn BrokerCommand(command: c_int, parameter: isize) -> f64 {
+    guard("BrokerCommand", 0.0, || match command {
+        GET_COMPLIANCE => 2.0,
+        GET_POSITION => {
+            let Some(symbol) = read_cstr(parameter as *const c_char) else {
+                return 0.0;
+            };
+            match bridge::net_position(symbol) {
+                Some(qty) => qty * bridge::AMOUNT_SCALE,
+                None => {
+                    state::log_message(&format!(
+                        "BrokerCommand(GET_POSITION, {symbol}): unavailable (not logged in?)"
+                    ));
+                    0.0
+                }
+            }
+        }
+        _ => 0.0,
+    })
 }
