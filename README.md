@@ -77,7 +77,7 @@ cargo test --lib -- --ignored --nocapture
 
 ## Installing and running inside Zorro
 
-> The steps below describe how Zorro's plugin loading and login UI work generically (per the Zorro manual and the sample plugins it ships with, e.g. `Bittrex.cpp`) and are accurate for those mechanics, but this project hasn't yet run inside an actual live Zorro session -- so treat the exact on-screen layout as a best-effort description, not a verified screenshot, until confirmed.
+> Verified against a live Zorro 3.1.1.2 session on the 32-bit `Zorro.exe` + Lite-C path: plugin load, login/logout/re-login, price and history reads, and a full buy / sell / sell round trip on Hyperliquid testnet. For the 64-bit path see [Known Issues](#known-issues).
 
 1. **Build the release DLL**:
    ```powershell
@@ -89,26 +89,44 @@ cargo test --lib -- --ignored --nocapture
    Copy-Item target\release\liquidzorro.dll "<ZorroFolder>\Plugin64\Hyperliquid.dll"
    ```
    Zorro64 loads plugins from `Plugin64\`; 32-bit `Zorro.exe` uses `Plugin\` and needs its own 32-bit build (`cargo build --release --target i686-pc-windows-msvc`).
-3. **Launch Zorro.** It scans the plugin folder and calls `BrokerOpen` on each DLL to learn its display name -- ours reports `"Hyperliquid"`, shown in the **Broker** dropdown.
-4. **Select "Hyperliquid".** User: blank. Password: your private key (`0x...`). Demo/Real toggle selects testnet/mainnet directly via `BrokerLogin` -- start with Demo.
+3. **Launch Zorro.** It scans the plugin folder and lists what it finds -- ours appears as `Hyperliquid` in the **Broker** dropdown.
+4. **Select "Hyperliquid".** User: blank. Password: your private key (`0x...`); copy-paste it into the Password field as-is, mind its exact length. Demo/Real toggle selects testnet/mainnet directly via `BrokerLogin` -- start with Demo.
 5. **Trigger login** (enter Trade or Test mode) and watch the message window -- that's where `BrokerLogin` reports success or failure.
-6. **Asset list.** `History\AssetsHyperliquid.csv` + `History\Accounts.csv` (in `examples\`) point Hyperliquid's accounts at a dedicated asset list instead of the generic default. `Accounts.csv`'s `NFA` column is `14` (not `0`) -- matching Zorro's own working examples (IB, Binance); `0` intermittently blocked closing trades with "Error 075 - closing not supported (NFA?)" even with the script's own `set(NFA|OFF)`.
-7. **`Zorro.ini`: set `AutoConfirm = 1`** (requires a restart, like any `Zorro.ini` change). Without it, `[Stop]` prompts to close open trades and, on confirming, tries to auto-close them through Zorro's own close machinery -- which hits the same NFA-style restriction and fails with repeated `Error 075`. The demo script already flattens its own position before finishing a normal run, so Zorro's separate auto-close isn't needed.
+6. **Copy the asset list.** Put `AssetsHyperliquid.csv` and `Accounts.csv` (both in `examples\`) into `History\`. They point the Hyperliquid accounts at the right asset list and login settings.
+7. **In `Zorro.ini`, set `AutoConfirm = 1`,** then restart Zorro. This stops Zorro prompting to close trades when you press `[Stop]`; the strategies close their own positions, so the prompt is never needed.
 
-The plugin DLL stays loaded across a `[Stop]`/`[Trade]` cycle, so its session outlives the script. `BrokerLogin(NULL, ...)` (Zorro's logout) drops that session and the next login reconnects from scratch, which is what makes it safe to change the key or flip Demo/Real between runs without restarting Zorro.
+You can switch between Demo and Real, or paste a different key, and press `[Trade]` again without restarting Zorro -- the plugin reconnects on each login.
 
 ### Demo strategy walkthrough
 
 `examples/HyperliquidBuySellDemo.c` (32-bit Lite-C) / `HyperliquidBuySellDemo+.cpp` (64-bit, needs external compilation -- see its header) is a linear state machine, advancing one step per `run()` call (~once a minute, since `BarPeriod = 1`):
 
-- **Setup:** `set(NFA|OFF)`, `SaveMode = 0` (avoids Zorro resuming a trade id our plugin no longer remembers after a restart), `Hedge = 2` (see below). `!is(TRADEMODE)` refuses Test/Train.
-- **`Step == -1`:** checks `GET_POSITION` (the plugin's real Hyperliquid balance, not Zorro's local trade list) -- if it's above `DUST_THRESHOLD_LOTS`, resumes straight into selling instead of buying again; smaller amounts are logged and ignored, since they tend to round to zero at the asset's real size precision and get rejected rather than sold.
+- **Setup:**
+  - `set(NFA|OFF)` -- lifts Zorro's NFA trading restrictions.
+  - `SaveMode = 0` -- starts each run from a clean slate.
+  - `Hedge = 2` -- lets a sell stand on its own rather than being treated as a position reversal.
+  - `!is(TRADEMODE)` -- restricts the script to `[Trade]`.
+- **`Step == -1`:** reads the live Hyperliquid position via `GET_POSITION`. A real position resumes directly into selling; anything under `DUST_THRESHOLD_LOTS` is reported and left alone.
 - **`Step == 0`:** waits for a live price, sizes `Lots` from `USD_AMOUNT`, `enterLong()`.
 - **`Step == 1`:** waits for the fill, splits the total into `Lots1`/`Lots2`.
-- **`Step == 2`/`3`:** sells each half via `sellViaShort()`, a helper around `enterShort()` (Hyperliquid spot has no real shorting, so to the plugin this is just "sell this much"). `exitLong` is never used: it goes through Zorro's close machinery, which this broker can't satisfy ("Error 075 - closing not supported"). `enterShort()` alone is not enough either -- at Zorro's default `Hedge = 0` a short against an open long is treated as a *reversal*, which re-enters that same close path and fails with "Reverse - can't close". `Hedge = 2` (full hedging: long and short may be open simultaneously) makes the sell a plain independent order. Zorro then records each sell as an open short position, which is why step 7 above disables its auto-close. Neither print claims success -- the plugin's own `BrokerBuy2` OK/FAILED log line is the accurate record.
-- **`Step == 4`:** IOC sells can partially fill, so this re-checks `GET_POSITION` once and sweeps anything above the dust threshold via `sellViaShort()`.
-- **`AMOUNT_SCALE` (100000):** `Amount` is a plain C `int`, can't hold a fraction of a unit -- `Lots` counts `1/AMOUNT_SCALE` sub-units instead, matching `bridge::AMOUNT_SCALE` and the CSV's `LotAmount` column.
+- **`Step == 2`/`3`:** sells each half through `sellViaShort()`, a helper around `enterShort()`. Hyperliquid spot has no shorting, so the plugin treats it as a plain sell. The plugin's own `BrokerBuy2` OK/FAILED line records what actually happened.
+- **`Step == 4`:** re-reads `GET_POSITION` and sweeps anything above the dust threshold, covering partially filled sells.
+- **`AMOUNT_SCALE` (100000):** `Lots` counts `1/AMOUNT_SCALE` sub-units, letting a whole-number `Amount` express fractional coin quantities. Matches `bridge::AMOUNT_SCALE` and the CSV's `LotAmount` column.
+
+### Stress test strategy
+
+`examples/HyperliquidStressTest.c` exercises much more of the plugin than the demo. Select it in Zorro and press `[Trade]`; it runs unattended for roughly 20 minutes, logging `PASS`/`FAIL` per check and a tally at the end.
+
+What it covers:
+
+- Account balance, and pricing two different assets.
+- 50 bars of candle history, checked for coherence.
+- Two market round trips, each selling the position back in three uneven parts.
+- A resting limit order placed below market, then cancelled.
+- An order under the exchange's $10 minimum, to confirm it is refused cleanly.
+
+It holds at most ~$57 at once and loses only spread. Edit `MIN_BALANCE` (default 750) to set the floor it refuses to trade below, and `CYCLES` to change how many round trips it makes.
 
 ## Known Issues
 
-- **The 64-bit deployment path (`Zorro64.exe` + `Plugin64\` + the compiled `HyperliquidBuySellDemo.dll` strategy) does not run end to end without a Zorro S license.** The broker plugin itself loads correctly under Zorro64 (`BrokerOpen` succeeds; "Hyperliquid" appears in the Broker dropdown), but Zorro64 refuses to execute a `.cpp`/`.dll`-based strategy's `run()` function without Zorro S. This holds even for a strategy pre-compiled externally (via `Source\VC++\compile64.bat`) with no `.cpp` source left in `Strategy\` to trigger on-the-fly compilation, and was observed both as an explicit `Error 063: C++ direct start requires Zorro S` and as a silent failure where no strategy output appears at all. The only path confirmed to run a strategy end to end on this project's license tier is 32-bit `Zorro.exe` + `Plugin\` + the Lite-C `HyperliquidBuySellDemo.c`, documented above. A Zorro S license should resolve the 64-bit path, but this has not been verified.
+- **64-bit Zorro:** the plugin loads and "Hyperliquid" appears in the Broker dropdown, but strategies don't start -- cause not yet established. Use the 32-bit path, which is verified end to end.
