@@ -158,6 +158,48 @@ fn places_and_closes_a_spot_order() {
     );
 }
 
+/// Covers the GTC + DO_CANCEL path, which the market-order tests never
+/// reach: rests a buy far below market so it cannot fill, confirms the
+/// exchange accepted it as resting, then cancels it. Buys nothing -- it
+/// only locks a little USDC for as long as the order is open.
+#[test]
+#[ignore]
+fn rests_and_cancels_a_limit_order() {
+    login(None, BaseUrl::Testnet).expect("login should succeed");
+    let plugin = state::get().unwrap();
+    let (pair, _) = test_pair(plugin);
+
+    state::set_order_type(ORDER_TYPE_GTC);
+
+    let price = asset_price(&pair).expect("price for sizing");
+    let limit_px = price * 0.6; // deep below market: must not fill
+    // clear the $10 minimum at the limit price, not the market price
+    let real_qty = (11.0 / limit_px).ceil().max(1.0);
+    let units = (real_qty * AMOUNT_SCALE).round() as i32;
+    println!("{pair} mid {price}, resting a buy for {real_qty} @ {limit_px}");
+
+    let (trade_id, rest_price, fill) =
+        place_order(&pair, units, limit_px).expect("limit order should be accepted");
+    assert_eq!(fill, 0, "a buy 40% below market must not fill");
+    println!("resting as trade id {trade_id} @ {rest_price}");
+
+    let status = trade_status(trade_id).expect("trade_status while resting");
+    println!("trade_status while resting: {status:?}");
+    let (.., profit, fill_state) = status;
+    assert_eq!(fill_state, 0, "a resting order has filled nothing");
+    assert_eq!(profit, 0.0, "a resting order must not accrue profit");
+
+    cancel_order(trade_id).expect("cancel should succeed");
+    println!("cancelled {trade_id}");
+
+    // a second cancel must fail cleanly rather than panic or hang
+    let second = cancel_order(trade_id);
+    println!("second cancel (expected to fail): {second:?}");
+    assert!(second.is_err(), "cancelling an already-cancelled order should error");
+
+    state::set_order_type(1); // back to IOC for any later test in this process
+}
+
 /// Standalone cleanup: sells any leftover balance for the test pair.
 #[test]
 #[ignore]
