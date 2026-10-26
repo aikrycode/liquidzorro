@@ -70,6 +70,26 @@ fn flatten_base_balance(plugin: &state::PluginState, pair_name: &str, base_token
     held
 }
 
+/// A [Stop]/[Trade] cycle keeps the DLL loaded, so logout must actually
+/// drop the session and the next login must reconnect -- this used to fail
+/// with "already logged in" (OnceLock), then silently reuse the stale
+/// session (short-circuit), which would have ignored a changed key or a
+/// Demo->Real switch. No orders.
+#[test]
+#[ignore]
+fn logout_then_login_reconnects() {
+    let first = login(None, BaseUrl::Testnet).expect("first login should succeed");
+    assert!(state::get().is_some(), "state should be set after login");
+
+    state::clear();
+    assert!(state::get().is_none(), "logout should drop the session");
+
+    let second = login(None, BaseUrl::Testnet).expect("re-login should succeed");
+    assert_eq!(first, second, "same key should give the same address");
+    assert!(state::get().is_some(), "state should be set again");
+    println!("logout/re-login OK, address={second}");
+}
+
 /// Verifies login and the read-only BrokerAsset/BrokerHistory2 paths. No orders.
 #[test]
 #[ignore]

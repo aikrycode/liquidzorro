@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::ffi::CString;
 use std::os::raw::{c_char, c_int};
 use std::sync::atomic::{AtomicI32, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock, RwLock};
 
 use alloy::primitives::Address;
 use hyperliquid_rust_sdk::{ExchangeClient, InfoClient};
@@ -32,7 +32,12 @@ pub struct PluginState {
 }
 
 static CALLBACKS: OnceLock<Callbacks> = OnceLock::new();
-static PLUGIN: OnceLock<PluginState> = OnceLock::new();
+// Holds a leaked `&'static PluginState` rather than the value itself, so
+// `get()` can hand out a plain reference (no lock guard held across the
+// `.await`s in bridge) while still allowing logout/re-login to replace it.
+// Each login leaks one PluginState; a handful per session is negligible,
+// and outstanding references from an in-flight call stay valid.
+static PLUGIN: RwLock<Option<&'static PluginState>> = RwLock::new(None);
 // Zorro wants a 6-digit-minimum trade id.
 static NEXT_TRADE_ID: AtomicI32 = AtomicI32::new(100_000);
 
@@ -61,23 +66,25 @@ pub fn log_message(msg: &str) {
 }
 
 pub fn get() -> Option<&'static PluginState> {
-    PLUGIN.get()
+    *PLUGIN.read().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Stores the logged-in clients. `false` if already logged in.
-pub fn init(
-    info_client: InfoClient,
-    exchange_client: ExchangeClient,
-    address: Address,
-) -> bool {
-    PLUGIN
-        .set(PluginState {
-            info_client,
-            exchange_client,
-            address,
-            trades: Mutex::new(HashMap::new()),
-        })
-        .is_ok()
+/// Stores the logged-in clients, replacing any previous session.
+pub fn init(info_client: InfoClient, exchange_client: ExchangeClient, address: Address) {
+    let state: &'static PluginState = Box::leak(Box::new(PluginState {
+        info_client,
+        exchange_client,
+        address,
+        trades: Mutex::new(HashMap::new()),
+    }));
+    *PLUGIN.write().unwrap_or_else(|e| e.into_inner()) = Some(state);
+}
+
+/// Drops the current session, so the next `BrokerLogin` reconnects from
+/// scratch (with whatever credentials/network Zorro supplies then) rather
+/// than silently reusing the old one.
+pub fn clear() {
+    *PLUGIN.write().unwrap_or_else(|e| e.into_inner()) = None;
 }
 
 /// Records a newly placed order, returns the Zorro-facing trade id.

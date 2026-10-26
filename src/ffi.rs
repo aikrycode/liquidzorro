@@ -80,9 +80,13 @@ pub unsafe extern "C" fn BrokerLogin(
     _accounts: *mut c_char,
 ) -> c_int {
     guard("BrokerLogin", 0, || {
-        // NULL user = logout; nothing to tear down.
+        // NULL user = logout. Drop the session so the next login actually
+        // reconnects instead of silently reusing these clients -- otherwise
+        // switching Demo/Real or pasting a different key mid-session would
+        // keep talking to the old one.
         if user.is_null() {
-            state::log_message("Hyperliquid: logout requested");
+            state::clear();
+            state::log_message("Hyperliquid: logged out");
             return 1;
         }
         // Password field = private key; Real/Demo toggle = mainnet/testnet.
