@@ -127,6 +127,20 @@ What it covers:
 
 It holds at most ~$57 at once and loses only spread. Edit `MIN_BALANCE` (default 750) to set the floor it refuses to trade below, and `CYCLES` to change how many round trips it makes.
 
+## Support
+
+If this project is useful to you, donations are welcome and entirely optional.
+
+```
+0xAe6AC0ebC924F8d0E09507aa834b3E23410b4702
+```
+
+Accepts **ETH or USDC** on **Ethereum, Arbitrum, Base and Optimism**. Please don't send BTC, SOL, NFTs, or tokens on non-EVM chains -- they can't be recovered.
+
+Donations are voluntary gifts. They buy no warranty, no support obligation, no priority on issues, and no influence over the roadmap; the disclaimer at the top of this README and the licence terms apply unchanged. Nothing here is an investment, and no return of any kind is offered or implied.
+
+Before sending, check the commit history for this line -- the address changes only in a deliberate commit, never silently. The project will never ask you for funds or for a private key through issues, pull requests, or direct messages.
+
 ## Known Issues
 
 - **64-bit Zorro:** the plugin loads and "Hyperliquid" appears in the Broker dropdown, but strategies don't start -- cause not yet established. Use the 32-bit path, which is verified end to end.
