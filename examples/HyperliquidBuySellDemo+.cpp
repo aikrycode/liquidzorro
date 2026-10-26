@@ -25,8 +25,16 @@
 var Lots1, Lots2;  // the two half-sized sell chunks
 int Step;          // -1 undetermined, 0 not started, 1 bought, 2/3 sold
                     // halves, 4 sweep dust, 5 done
-int Resuming;      // 1 if this position was found via GET_POSITION, not
-                    // bought this session (changes how we close it)
+
+// Forces a real sell. Hyperliquid spot has no shorting, so to the plugin
+// this is just "sell this much" -- but Zorro still records it as an open
+// short, which is why Zorro.ini needs AutoConfirm = 1 (see README) to stop
+// [Stop] trying to cover positions that are already flat on the exchange.
+void sellViaShort(var SellLots)
+{
+	Lots = SellLots;
+	enterShort();
+}
 
 DLLFUNC void run()
 {
@@ -36,6 +44,9 @@ DLLFUNC void run()
 	set(LOGFILE);
 	set(NFA|OFF);   // else exitLong fails: "Error 075 - closing not supported"
 	SaveMode = 0;   // avoid resuming a trade id our plugin no longer knows
+	Hedge = 2;      // full hedging; default 0 would make enterShort() reverse
+	                // the open long, i.e. go through the close machinery that
+	                // fails here ("Reverse - can't close", Error 075)
 
 	if(!is(TRADEMODE)) {
 		printf("\nUnsupported function: this demo only runs in [Trade] mode.");
@@ -57,12 +68,10 @@ DLLFUNC void run()
 		if(ExistingLots > DUST_THRESHOLD_LOTS) {
 			Lots1 = floor(ExistingLots/2);
 			Lots2 = ExistingLots - Lots1;
-			Resuming = 1;
 			printf("\nResuming: existing position of %.0f lots -- selling instead of buying",ExistingLots);
 			Step = 2;
 		} else {
 			if(ExistingLots > 0) printf("\nIgnoring dust position: %.0f lots",ExistingLots);
-			Resuming = 0;
 			Step = 0;
 		}
 	}
@@ -91,22 +100,20 @@ DLLFUNC void run()
 		return;
 	}
 
-	// exitLong only closes an existing Zorro trade object; a resumed
-	// position has none, so exitLong would silently no-op. enterShort
-	// always places a real sell via BrokerBuy2 (Hyperliquid spot has no
-	// real shorting, so to the plugin this is just "sell this much").
-	// Neither call reports success here -- the plugin's own BrokerBuy2
-	// OK/FAILED log line (printed by the DLL, not this script) is the
-	// accurate record of what actually happened.
+	// exitLong goes through Zorro's close machinery, which this broker can't
+	// satisfy ("Error 075 - closing not supported"); sellViaShort + Hedge=2
+	// bypasses it entirely. It doesn't report success here -- the plugin's
+	// own BrokerBuy2 OK/FAILED log line (from the DLL, not this script) is
+	// the accurate record.
 	if(Step == 2) {
-		if(Resuming) { Lots = Lots1; enterShort(); } else exitLong(0,0,Lots1);
+		sellViaShort(Lots1);
 		printf("\nSell submitted: first half, %.0f lots",Lots1);
 		Step = 3;
 		return;
 	}
 
 	if(Step == 3) {
-		if(Resuming) { Lots = Lots2; enterShort(); } else exitLong(0,0,Lots2);
+		sellViaShort(Lots2);
 		printf("\nSell submitted: second half, %.0f lots",Lots2);
 		Step = 4;
 		return;
@@ -117,8 +124,7 @@ DLLFUNC void run()
 		var Leftover = brokerCommand(GET_POSITION,SymbolTrade);
 		if(Leftover > DUST_THRESHOLD_LOTS) {
 			printf("\nSweeping leftover: %.0f lots",Leftover);
-			Lots = Leftover;
-			enterShort();
+			sellViaShort(Leftover);
 		} else if(Leftover > 0) {
 			printf("\nIgnoring dust leftover: %.0f lots",Leftover);
 		}
