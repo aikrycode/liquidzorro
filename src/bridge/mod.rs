@@ -72,7 +72,7 @@ pub fn place_order(symbol: &str, amount: i32, limit: f64) -> Result<(i32, f64, i
     let is_buy = amount > 0;
     let raw_sz = amount.unsigned_abs() as f64 / AMOUNT_SCALE;
 
-    let (sz, response) = runtime::get().block_on(async {
+    let (sz, limit_px, response) = runtime::get().block_on(async {
         // round to the asset's real size precision, or Hyperliquid rejects
         // the order ("Order has invalid size")
         let sz_decimals = spot_sz_decimals(&plugin.info_client, symbol).await?;
@@ -88,7 +88,10 @@ pub fn place_order(symbol: &str, amount: i32, limit: f64) -> Result<(i32, f64, i
             // Hyperliquid has no fill-or-kill TIF, so FOK degrades to IOC --
             // immediate like FOK, but may fill partially instead of killing.
             let tif = if state::order_type() == ORDER_TYPE_GTC { "Gtc" } else { "Ioc" };
-            (limit, tif)
+            // Prices obey the same precision rule as sizes; an unrounded one
+            // straight from Zorro is rejected as an invalid price.
+            let px = round_to_significant_and_decimal(limit, 5, 8u32.saturating_sub(sz_decimals));
+            (px, tif)
         } else {
             (
                 marketable_spot_price(&plugin.info_client, symbol, is_buy, 0.05).await?,
@@ -112,7 +115,7 @@ pub fn place_order(symbol: &str, amount: i32, limit: f64) -> Result<(i32, f64, i
             .order(order, None)
             .await
             .map_err(|e| format!("order request failed: {e}"))?;
-        Ok::<_, String>((sz, response))
+        Ok::<_, String>((sz, limit_px, response))
     })?;
 
     let exchange_response = match response {
@@ -126,14 +129,16 @@ pub fn place_order(symbol: &str, amount: i32, limit: f64) -> Result<(i32, f64, i
 
     match status {
         ExchangeDataStatus::Filled(order) => {
-            let price: f64 = order.avg_px.parse().unwrap_or(limit.max(0.0));
+            let price: f64 = order.avg_px.parse().unwrap_or(limit_px);
             let fill_sz: f64 = order.total_sz.parse().unwrap_or(sz);
             let zorro_id = state::register_trade(symbol, order.oid, is_buy, price, fill_sz);
             Ok((zorro_id, price, (fill_sz * AMOUNT_SCALE).round() as i32))
         }
+        // Resting: accepted but unfilled. Zorro reads fill 0 as a pending
+        // trade and polls BrokerTrade until it fills or it cancels it.
         ExchangeDataStatus::Resting(order) => {
-            let zorro_id = state::register_trade(symbol, order.oid, is_buy, limit, sz);
-            Ok((zorro_id, limit, 0))
+            let zorro_id = state::register_trade(symbol, order.oid, is_buy, limit_px, sz);
+            Ok((zorro_id, limit_px, 0))
         }
         ExchangeDataStatus::Error(e) => Err(format!("order error: {e}")),
         other => Err(format!("unexpected order status: {other:?}")),
@@ -235,20 +240,23 @@ pub fn trade_status(zorro_id: i32) -> Option<(f64, f64, f64, f64, i32)> {
 
     let close_price = asset_price(&info.coin).unwrap_or(info.entry_price);
     let direction = if info.is_buy { 1.0 } else { -1.0 };
-    let profit = direction * (close_price - info.entry_price) * info.entry_sz;
 
-    // fill_state is in AMOUNT_SCALE sub-units, like BrokerBuy2's fill_amount
-    let fill_state = match status.order {
-        None => -1, // no longer tracked -> treat as closed
+    // fill_state is in AMOUNT_SCALE sub-units, like BrokerBuy2's fill_amount.
+    // filled_sz drives profit: an order still resting has none, so it must
+    // not accrue P&L just because the market moved away from its limit.
+    let (fill_state, filled_sz) = match status.order {
+        None => (-1, info.entry_sz), // no longer tracked -> treat as closed
         Some(order_info) => match order_info.status.as_str() {
-            "filled" => (info.entry_sz * AMOUNT_SCALE).round() as i32,
-            "canceled" | "rejected" | "marginCanceled" => NAY - 1,
+            "filled" => ((info.entry_sz * AMOUNT_SCALE).round() as i32, info.entry_sz),
+            "canceled" | "rejected" | "marginCanceled" => (NAY - 1, 0.0),
             _ => {
                 let remaining: f64 = order_info.order.sz.parse().unwrap_or(info.entry_sz);
-                ((info.entry_sz - remaining).max(0.0) * AMOUNT_SCALE).round() as i32
+                let filled = (info.entry_sz - remaining).max(0.0);
+                ((filled * AMOUNT_SCALE).round() as i32, filled)
             }
         },
     };
+    let profit = direction * (close_price - info.entry_price) * filled_sz;
 
     Some((info.entry_price, close_price, 0.0, profit, fill_state))
 }
