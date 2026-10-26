@@ -5,10 +5,8 @@
 
 use super::*;
 
-/// One-off diagnostic: prints every spot pair Hyperliquid lists on whichever
-/// network `HL_TESTNET_PRIVKEY` points at, so a real pair name (e.g. for
-/// BTC) can be confirmed instead of guessed. Not a real test -- just run
-/// with `cargo test -- --ignored --nocapture bridge::tests::lists_spot_pairs`.
+/// Diagnostic: prints every spot pair on whichever network
+/// `HL_TESTNET_PRIVKEY` points at.
 #[test]
 #[ignore]
 fn lists_spot_pairs() {
@@ -35,9 +33,8 @@ fn lists_spot_pairs() {
     }
 }
 
-/// `(pair_name, base_token_name)` for the first entry in `spot_meta()`'s
-/// universe, used as "some spot pair to test against" throughout -- on
-/// Hyperliquid testnet that's PURR/USDC with base token name "PURR".
+/// `(pair_name, base_token_name)` for the first `spot_meta()` entry --
+/// Hyperliquid's own canonical spot listing on testnet.
 fn test_pair(plugin: &state::PluginState) -> (String, String) {
     let spot_meta = runtime::get()
         .block_on(plugin.info_client.spot_meta())
@@ -51,9 +48,8 @@ fn test_pair(plugin: &state::PluginState) -> (String, String) {
     (asset.name.clone(), base_token.name.clone())
 }
 
-/// Sells any held balance of `base_token_name` down to (near) zero, at a
-/// wide slippage buffer to maximize fill odds for what's usually a dust
-/// amount. Returns the amount it attempted to sell (0.0 if nothing was held).
+/// Sells any held balance of `base_token_name` via `place_order` (reuses
+/// its sz_decimals rounding). Returns the amount attempted (0.0 if none held).
 fn flatten_base_balance(plugin: &state::PluginState, pair_name: &str, base_token_name: &str) -> f64 {
     let balances = runtime::get()
         .block_on(plugin.info_client.user_token_balances(plugin.address))
@@ -68,30 +64,13 @@ fn flatten_base_balance(plugin: &state::PluginState, pair_name: &str, base_token
         return 0.0;
     }
 
-    let limit_px = runtime::get()
-        .block_on(marketable_spot_price(&plugin.info_client, pair_name, false, 0.15))
-        .expect("marketable price for flatten sell");
-    let order = ClientOrderRequest {
-        asset: pair_name.to_string(),
-        is_buy: false,
-        reduce_only: false,
-        limit_px,
-        sz: held,
-        cloid: None,
-        order_type: ClientOrder::Limit(ClientLimit {
-            tif: "Ioc".to_string(),
-        }),
-    };
-    let response = runtime::get()
-        .block_on(plugin.exchange_client.order(order, None))
-        .expect("flatten sell order request");
-    println!("flatten sell of {held} {base_token_name}: {response:?}");
+    let amount = (held * AMOUNT_SCALE).round() as i32;
+    let result = place_order(pair_name, -amount, 0.0);
+    println!("flatten sell of {held} {base_token_name}: {result:?}");
     held
 }
 
-/// Verifies login, and the read-only paths behind `BrokerAsset` (live price)
-/// and `BrokerHistory2` (candles). Never places an order, so it never
-/// spends testnet USDC.
+/// Verifies login and the read-only BrokerAsset/BrokerHistory2 paths. No orders.
 #[test]
 #[ignore]
 fn connects_and_reads_market_data() {
@@ -115,13 +94,8 @@ fn connects_and_reads_market_data() {
     assert!(candles.is_some(), "expected candle history for {pair}");
 }
 
-/// Verifies the order lifecycle behind `BrokerBuy2`/`BrokerTrade`/
-/// `BrokerAccount`: buys the smallest size that clears Hyperliquid's $10
-/// minimum order notional, checks trade status, sells back to close, then
-/// flattens any leftover (IOC orders can partially fill) so the account
-/// ends up flat regardless of how the sell leg filled. This DOES spend a
-/// small amount of testnet USDC -- the order's notional value, round-tripped
-/// back out again, so the net cost is only slippage (a few cents at most).
+/// Buys just above Hyperliquid's $10 minimum, checks trade status, sells
+/// back, flattens any leftover. Spends a little testnet USDC (slippage only).
 #[test]
 #[ignore]
 fn places_and_closes_a_spot_order() {
@@ -132,10 +106,7 @@ fn places_and_closes_a_spot_order() {
     let (balance_before, ..) = account_balance().expect("account_balance before");
     println!("USDC balance before: {balance_before}");
 
-    // Hyperliquid rejects orders below $10 notional; size up to just clear
-    // that floor (with a small buffer for price movement) rather than
-    // hardcoding a unit count that could fall under it. `units` is in
-    // AMOUNT_SCALE sub-units, matching what BrokerBuy2's Amount expects.
+    // clear Hyperliquid's $10 minimum with a small buffer; units = AMOUNT_SCALE sub-units
     let price = asset_price(&pair).expect("price for sizing");
     let real_qty = (11.0 / price).ceil().max(1.0);
     let units = (real_qty * AMOUNT_SCALE).round() as i32;
@@ -154,9 +125,7 @@ fn places_and_closes_a_spot_order() {
     println!("sold {sell_fill} {pair} @ {sell_price}, trade id {close_id}");
     assert!(sell_fill > 0, "expected the IOC market sell to fill");
 
-    // IOC orders can partially fill against a thin book; don't assume the
-    // sell leg fully closed the position -- verify against the real
-    // balance and sweep any remainder instead of leaving it open.
+    // IOC can partially fill; sweep any remainder instead of leaving it open
     let leftover = flatten_base_balance(plugin, &pair, &base_token);
     if leftover > 0.0 {
         println!("swept {leftover} leftover {base_token} after partial sell fill");
@@ -169,9 +138,7 @@ fn places_and_closes_a_spot_order() {
     );
 }
 
-/// Standalone cleanup: sells any leftover base-token balance for the test
-/// pair. Not part of normal test runs -- use after a prior run leaves a
-/// position open (e.g. an assertion failed partway through).
+/// Standalone cleanup: sells any leftover balance for the test pair.
 #[test]
 #[ignore]
 fn flattens_leftover_balance() {

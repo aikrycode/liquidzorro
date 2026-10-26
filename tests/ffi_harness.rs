@@ -1,13 +1,7 @@
-//! Drives the compiled `liquidzorro.dll` exactly the way Zorro will: loads
-//! it dynamically (not as a Rust dependency -- this mimics an external C
-//! caller), resolves each export by its exact C signature, and calls it
-//! with real raw pointers and real `extern "C"` callback functions.
-//!
-//! Everything so far (the live smoke tests in `src/bridge/tests.rs`) called
-//! our own Rust functions directly; this is the first thing that actually
-//! exercises the unsafe pointer marshalling, CStr parsing, output-pointer
-//! writes, and callback transmutes at the real FFI boundary -- the part
-//! that's hardest to debug once it's Zorro, rather than us, calling in.
+//! Drives the compiled `liquidzorro.dll` the way Zorro will: loaded
+//! dynamically, each export called by its real C signature with real raw
+//! pointers and callbacks -- exercises the actual FFI boundary, not just
+//! our Rust functions directly.
 
 use std::ffi::{c_void, CStr, CString};
 use std::os::raw::{c_char, c_int};
@@ -40,9 +34,7 @@ type BrokerBuy2Fn =
 type BrokerTradeFn = unsafe extern "C" fn(c_int, *mut f64, *mut f64, *mut f64, *mut f64) -> c_int;
 type BrokerCommandFn = unsafe extern "C" fn(c_int, isize) -> f64;
 
-/// Mirrors `ffi::T6`'s layout (32 bytes: one f64 + six f32) without
-/// depending on the lib crate -- Zorro wouldn't share our Rust types either,
-/// it only agrees on the memory layout via trading.h.
+/// Mirrors `ffi::T6`'s layout without depending on the lib crate.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct T6Mirror {
@@ -87,9 +79,8 @@ fn cstring_buf(min_len: usize) -> Vec<c_char> {
     vec![0 as c_char; min_len]
 }
 
-/// Exercises every export through its real C signature without ever
-/// touching the network (BrokerLogin is called with HL_TESTNET_PRIVKEY
-/// deliberately unset, so it fails fast locally) -- safe to run anywhere.
+/// Exercises every export via its real C signature, network-free
+/// (HL_TESTNET_PRIVKEY is unset, so BrokerLogin fails fast locally).
 #[test]
 fn drives_every_export_like_zorro_would() {
     std::env::remove_var("HL_TESTNET_PRIVKEY");
@@ -139,7 +130,7 @@ fn drives_every_export_like_zorro_would() {
         // Everything below requires being logged in, which we deliberately
         // are not -- confirms the "not logged in" path is reached correctly
         // through real pointers, and that output buffers are left untouched.
-        let asset = CString::new("PURR/USDC").unwrap();
+        let asset = CString::new("HYPE/USDC").unwrap();
 
         let mut time_sentinel = f64::MIN;
         let rc = broker_time(&mut time_sentinel as *mut f64);
