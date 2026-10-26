@@ -333,11 +333,51 @@ const GET_COMPLIANCE: c_int = 51;
 /// trade bookkeeping -- survives a full restart. AMOUNT_SCALE sub-units.
 const GET_POSITION: c_int = 53;
 
+/// GET_BROKERZONE: time zone of the broker's timestamps. `0` = UTC, which
+/// is what Hyperliquid returns.
+const GET_BROKERZONE: c_int = 40;
+
+/// GET_MAXTICKS: cap on ticks per `BrokerHistory2` call. Hyperliquid's
+/// `candles_snapshot` tops out at 5000 per request.
+const GET_MAXTICKS: c_int = 43;
+
+/// SET_ORDERTYPE: 0 = fill-or-kill, 1 = immediate-or-cancel, 2 = GTC.
+/// Echoing the value back is how a plugin tells Zorro it honours order
+/// types at all -- returning 0 makes Zorro assume limit orders are
+/// unsupported and skip them entirely.
+const SET_ORDERTYPE: c_int = 157;
+
+/// DO_CANCEL: cancel the resting order with the Zorro trade id in
+/// `parameter`.
+const DO_CANCEL: c_int = 301;
+
 /// TODO(Phase 4): remaining codes, once a live session shows what's needed.
 #[no_mangle]
 pub unsafe extern "C" fn BrokerCommand(command: c_int, parameter: isize) -> f64 {
     guard("BrokerCommand", 0.0, || match command {
         GET_COMPLIANCE => 2.0,
+        GET_BROKERZONE => 0.0, // UTC
+        GET_MAXTICKS => 5000.0,
+        SET_ORDERTYPE => {
+            let order_type = parameter as i32;
+            state::set_order_type(order_type);
+            order_type as f64
+        }
+        DO_CANCEL => {
+            let trade_id = parameter as i32;
+            match bridge::cancel_order(trade_id) {
+                Ok(()) => {
+                    state::log_message(&format!("BrokerCommand(DO_CANCEL): cancelled {trade_id}"));
+                    1.0
+                }
+                Err(e) => {
+                    state::log_message(&format!(
+                        "BrokerCommand(DO_CANCEL, {trade_id}) FAILED: {e}"
+                    ));
+                    0.0
+                }
+            }
+        }
         GET_POSITION => {
             let Some(symbol) = read_cstr(parameter as *const c_char) else {
                 return 0.0;
