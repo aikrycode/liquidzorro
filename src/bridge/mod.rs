@@ -8,8 +8,8 @@ use std::env;
 
 use alloy::signers::local::PrivateKeySigner;
 use hyperliquid_rust_sdk::{
-    BaseUrl, CandlesSnapshotResponse, ClientLimit, ClientOrder, ClientOrderRequest, ExchangeClient,
-    ExchangeDataStatus, ExchangeResponseStatus, InfoClient,
+    BaseUrl, CandlesSnapshotResponse, ClientCancelRequest, ClientLimit, ClientOrder,
+    ClientOrderRequest, ExchangeClient, ExchangeDataStatus, ExchangeResponseStatus, InfoClient,
 };
 
 use crate::ffi::{T6, NAY};
@@ -56,6 +56,9 @@ pub fn login(privkey: Option<&str>, base_url: BaseUrl) -> Result<alloy::primitiv
 /// Zorro script mirrors this via its own AMOUNT_SCALE constant.
 pub const AMOUNT_SCALE: f64 = 100_000.0;
 
+/// Zorro's SET_ORDERTYPE value for a good-till-cancelled (resting) order.
+pub const ORDER_TYPE_GTC: i32 = 2;
+
 /// Market order if `limit == 0.0`, else a resting GTC limit order. Positive
 /// `amount` buys, negative sells (no separate close export). Returns
 /// `(zorro_trade_id, fill_price, fill_amount)`, all in `AMOUNT_SCALE` units.
@@ -76,9 +79,16 @@ pub fn place_order(symbol: &str, amount: i32, limit: f64) -> Result<(i32, f64, i
         let sz = round_to_decimals(raw_sz, sz_decimals);
 
         // SDK's market_open() only checks the perp universe for price, 404s
-        // on spot pairs -- build the IOC limit order against spot_meta() ourselves
+        // on spot pairs -- build the limit order against spot_meta() ourselves.
+        //
+        // No limit price means a market order: an IOC priced through the mid
+        // so it fills immediately. With a limit price, Zorro's SET_ORDERTYPE
+        // decides whether it may rest (GTC) or must fill now (FOK/IOC).
         let (limit_px, tif) = if limit > 0.0 {
-            (limit, "Gtc")
+            // Hyperliquid has no fill-or-kill TIF, so FOK degrades to IOC --
+            // immediate like FOK, but may fill partially instead of killing.
+            let tif = if state::order_type() == ORDER_TYPE_GTC { "Gtc" } else { "Ioc" };
+            (limit, tif)
         } else {
             (
                 marketable_spot_price(&plugin.info_client, symbol, is_buy, 0.05).await?,
@@ -185,6 +195,33 @@ fn round_to_significant_and_decimal(value: f64, sig_figs: u32, max_decimals: u32
     let scale = 10f64.powi(sig_figs as i32 - magnitude - 1);
     let rounded = (abs_value * scale).round() / scale;
     round_to_decimals(rounded.copysign(value), max_decimals)
+}
+
+/// Cancels a resting order by its Zorro trade id. Backs DO_CANCEL.
+pub fn cancel_order(zorro_id: i32) -> Result<(), String> {
+    let plugin = state::get().ok_or("not logged in")?;
+    let info = state::get_trade(zorro_id).ok_or_else(|| format!("unknown trade id {zorro_id}"))?;
+
+    let response = runtime::get()
+        .block_on(plugin.exchange_client.cancel(
+            ClientCancelRequest {
+                asset: info.coin.clone(),
+                oid: info.oid,
+            },
+            None,
+        ))
+        .map_err(|e| format!("cancel request failed: {e}"))?;
+
+    match response {
+        ExchangeResponseStatus::Err(e) => Err(format!("cancel rejected: {e}")),
+        ExchangeResponseStatus::Ok(r) => match r.data.and_then(|d| d.statuses.into_iter().next()) {
+            Some(ExchangeDataStatus::Error(e)) => Err(format!("cancel error: {e}")),
+            // Success comes back as a bare "success" status; anything else
+            // that isn't an explicit error means the order is no longer open,
+            // which is what the caller wanted either way.
+            _ => Ok(()),
+        },
+    }
 }
 
 /// Status of a previously placed order: `(open_price, close_price, cost,
