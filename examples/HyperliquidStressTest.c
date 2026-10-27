@@ -52,6 +52,7 @@ var PositionBeforeBuy;
 var PositionBeforeReject;
 int LimitTradeID;
 int LimitPollsLeft;
+int LimitCancelled;
 
 void check(string Name, int Ok)
 {
@@ -241,6 +242,7 @@ function run()
 		brokerCommand(CMD_SET_ORDERTYPE, ORDERTYPE_IOC);
 		LimitTradeID = 0;
 		LimitPollsLeft = 5;
+		LimitCancelled = 0;
 		Phase = PH_LIMIT_POLL;
 		return;
 	}
@@ -274,6 +276,7 @@ function run()
 	if(Phase == PH_LIMIT_CANCEL) {
 		var Result = brokerCommand(CMD_DO_CANCEL, LimitTradeID);
 		check("DO_CANCEL cancels the resting order", Result == 1);
+		if(Result == 1) LimitCancelled = 1;
 		Phase = PH_REJECT;
 		return;
 	}
@@ -302,12 +305,13 @@ function run()
 		int Stranded = 0;
 
 		// Safety net: never leave a resting order behind holding collateral,
-		// whatever happened in the limit phase above.
+		// whatever happened in the limit phase above. A zero-lot trade that
+		// was already cancelled there still sits in Zorro's book, so skip it
+		// -- cancelling it again just fails and would look like a leak.
 		for(open_trades) {
-			if(TradeLots == 0) {
+			if(TradeLots == 0 && !(TradeID == LimitTradeID && LimitCancelled)) {
 				printf("\nCancelling stranded order, trade id %d", TradeID);
-				brokerCommand(CMD_DO_CANCEL, TradeID);
-				Stranded++;
+				if(brokerCommand(CMD_DO_CANCEL, TradeID) == 1) Stranded++;
 			}
 		}
 		check("No resting orders left behind", Stranded == 0);
