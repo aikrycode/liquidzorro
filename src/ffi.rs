@@ -181,7 +181,10 @@ pub unsafe extern "C" fn BrokerAsset(
             *p_min_amount = 0.0;
         }
         if !p_margin_cost.is_null() {
-            *p_margin_cost = 100.0; // spot = fully collateralized, no leverage
+            // Margin required per lot. Spot is fully collateralized; a perp
+            // needs price/leverage, so Zorro sizes leveraged positions right
+            // instead of assuming they cost their full notional.
+            *p_margin_cost = bridge::margin_cost_per_lot(symbol, price);
         }
         if !p_roll_long.is_null() {
             *p_roll_long = 0.0;
@@ -268,13 +271,21 @@ pub unsafe extern "C" fn BrokerBuy2(
     p_fill: *mut c_int,
 ) -> c_int {
     guard("BrokerBuy2", 0, || {
-        let _ = stop_dist; // TODO(Phase 4): wire to a Hyperliquid trigger order
         let Some(symbol) = read_cstr(asset) else {
             state::log_message("BrokerBuy2: invalid/missing asset name");
             return 0;
         };
-        let side = if amount > 0 { "buy" } else { "sell" };
-        match bridge::place_order(symbol, amount, limit) {
+        // Zorro signals "this call closes a position" with StopDist == -1;
+        // the sign of Amount alone can't distinguish closing a long from
+        // opening a short. Any other value is a stop distance, still TODO.
+        let closing = stop_dist == -1.0;
+        let side = match (amount > 0, closing) {
+            (true, false) => "buy",
+            (false, false) => "sell",
+            (true, true) => "close short",
+            (false, true) => "close long",
+        };
+        match bridge::place_order(symbol, amount, limit, closing) {
             Ok((zorro_id, price, fill)) => {
                 if !p_price.is_null() {
                     *p_price = price;
@@ -324,8 +335,9 @@ pub unsafe extern "C" fn BrokerTrade(
     })
 }
 
-/// GET_COMPLIANCE: NFA-restriction query. `0` (default) made Zorro refuse
-/// `exitLong` ("Error 075"); both real sample plugins answer `2`, so do we.
+/// GET_COMPLIANCE: NFA-restriction query. `2` means no NFA restrictions,
+/// matching the sample plugins; a lower value makes Zorro refuse to close
+/// trades with "Error 075".
 const GET_COMPLIANCE: c_int = 51;
 
 /// GET_POSITION: real held balance for the symbol in `parameter` (`char*`),
@@ -351,7 +363,13 @@ const SET_ORDERTYPE: c_int = 157;
 /// `parameter`.
 const DO_CANCEL: c_int = 301;
 
-/// TODO(Phase 4): remaining codes, once a live session shows what's needed.
+/// SET_SYMBOL: the asset subsequent commands apply to.
+const SET_SYMBOL: c_int = 132;
+
+/// SET_LEVERAGE: leverage for subsequent perp trades on the SET_SYMBOL asset.
+const SET_LEVERAGE: c_int = 140;
+
+/// Unhandled codes return 0, which Zorro reads as "unsupported".
 #[no_mangle]
 pub unsafe extern "C" fn BrokerCommand(command: c_int, parameter: isize) -> f64 {
     guard("BrokerCommand", 0.0, || match command {
@@ -362,6 +380,33 @@ pub unsafe extern "C" fn BrokerCommand(command: c_int, parameter: isize) -> f64 
             let order_type = parameter as i32;
             state::set_order_type(order_type);
             order_type as f64
+        }
+        SET_SYMBOL => match read_cstr(parameter as *const c_char) {
+            Some(symbol) => {
+                state::set_symbol(symbol);
+                1.0
+            }
+            None => 0.0,
+        },
+        SET_LEVERAGE => {
+            // applies to whichever asset SET_SYMBOL last named
+            let Some(symbol) = state::symbol() else {
+                state::log_message("BrokerCommand(SET_LEVERAGE): no symbol set");
+                return 0.0;
+            };
+            let leverage = parameter as i32;
+            match bridge::set_leverage(&symbol, leverage.max(0) as u32) {
+                Ok(()) => {
+                    state::log_message(&format!(
+                        "BrokerCommand(SET_LEVERAGE): {symbol} set to {leverage}x cross"
+                    ));
+                    leverage as f64
+                }
+                Err(e) => {
+                    state::log_message(&format!("BrokerCommand(SET_LEVERAGE, {symbol}) FAILED: {e}"));
+                    0.0
+                }
+            }
         }
         DO_CANCEL => {
             let trade_id = parameter as i32;
