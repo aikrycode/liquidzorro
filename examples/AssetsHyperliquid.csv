@@ -1,3 +1,5 @@
 Name,Price,Spread,RollLong,RollShort,PIP,PIPCost,MarginCost,Leverage,LotAmount,Commission,Symbol
 BTC/USD,90000,1,0,0,1,1,100,1,0.00001,0,@50
 HYPE/USDC,30,0.01,0,0,0.01,0.01,100,1,0.00001,0,@1035
+ETH-PERP,2400,0.1,0,0,0.01,0.01,100,1,0.00001,0,ETH
+BTC-PERP,90000,1,0,0,1,1,100,1,0.00001,0,BTC
