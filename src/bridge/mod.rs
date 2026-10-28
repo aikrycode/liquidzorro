@@ -12,6 +12,7 @@ use hyperliquid_rust_sdk::{
     ClientOrderRequest, ExchangeClient, ExchangeDataStatus, ExchangeResponseStatus, InfoClient,
 };
 
+use crate::assets::{self, AssetInfo};
 use crate::ffi::{T6, NAY};
 use crate::{runtime, state};
 
@@ -59,12 +60,24 @@ pub const AMOUNT_SCALE: f64 = 100_000.0;
 /// Zorro's SET_ORDERTYPE value for a good-till-cancelled (resting) order.
 pub const ORDER_TYPE_GTC: i32 = 2;
 
-/// Market order if `limit == 0.0`, else a resting GTC limit order. Positive
-/// `amount` buys, negative sells (no separate close export). Returns
-/// `(zorro_trade_id, fill_price, fill_amount)`, all in `AMOUNT_SCALE` units.
+/// Market order if `limit == 0.0`, else a limit order that rests (GTC) or
+/// fills immediately depending on Zorro's SET_ORDERTYPE. Positive `amount`
+/// buys, negative sells -- there is no separate close export.
 ///
-/// TODO: `stop_dist` isn't wired to a Hyperliquid trigger order yet.
-pub fn place_order(symbol: &str, amount: i32, limit: f64) -> Result<(i32, f64, i32), String> {
+/// `closing` is Zorro's `StopDist == -1` flag, meaning "this call is closing
+/// a position". On perps that becomes `reduce_only`, so an oversized close
+/// flattens instead of silently flipping into an opposing position. Spot has
+/// no position to reduce, so the flag is inert there.
+///
+/// Returns `(zorro_trade_id, fill_price, fill_amount)` in `AMOUNT_SCALE` units.
+///
+/// TODO: a real `stop_dist` isn't wired to a Hyperliquid trigger order yet.
+pub fn place_order(
+    symbol: &str,
+    amount: i32,
+    limit: f64,
+    closing: bool,
+) -> Result<(i32, f64, i32), String> {
     let plugin = state::get().ok_or("not logged in")?;
     if amount == 0 {
         return Err("amount must be nonzero".to_string());
@@ -73,28 +86,22 @@ pub fn place_order(symbol: &str, amount: i32, limit: f64) -> Result<(i32, f64, i
     let raw_sz = amount.unsigned_abs() as f64 / AMOUNT_SCALE;
 
     let (sz, limit_px, response) = runtime::get().block_on(async {
-        // round to the asset's real size precision, or Hyperliquid rejects
-        // the order ("Order has invalid size")
-        let sz_decimals = spot_sz_decimals(&plugin.info_client, symbol).await?;
-        let sz = round_to_decimals(raw_sz, sz_decimals);
+        // Rounding rules depend on which universe the symbol lives in --
+        // notably prices, where perps allow fewer decimals than spot.
+        let asset = resolve_asset(&plugin.info_client, symbol).await?;
+        let sz = assets::round_size(raw_sz, asset.sz_decimals);
 
         // SDK's market_open() only checks the perp universe for price, 404s
-        // on spot pairs -- build the limit order against spot_meta() ourselves.
-        //
-        // No limit price means a market order: an IOC priced through the mid
-        // so it fills immediately. With a limit price, Zorro's SET_ORDERTYPE
-        // decides whether it may rest (GTC) or must fill now (FOK/IOC).
+        // on spot pairs -- build the order ourselves so one path serves both.
         let (limit_px, tif) = if limit > 0.0 {
             // Hyperliquid has no fill-or-kill TIF, so FOK degrades to IOC --
             // immediate like FOK, but may fill partially instead of killing.
             let tif = if state::order_type() == ORDER_TYPE_GTC { "Gtc" } else { "Ioc" };
-            // Prices obey the same precision rule as sizes; an unrounded one
-            // straight from Zorro is rejected as an invalid price.
-            let px = round_to_significant_and_decimal(limit, 5, 8u32.saturating_sub(sz_decimals));
-            (px, tif)
+            // An unrounded price straight from Zorro is rejected as invalid.
+            (assets::round_price(limit, &asset), tif)
         } else {
             (
-                marketable_spot_price(&plugin.info_client, symbol, is_buy, 0.05).await?,
+                marketable_price(&plugin.info_client, symbol, &asset, is_buy, 0.05).await?,
                 "Ioc",
             )
         };
@@ -102,7 +109,7 @@ pub fn place_order(symbol: &str, amount: i32, limit: f64) -> Result<(i32, f64, i
         let order = ClientOrderRequest {
             asset: symbol.to_string(),
             is_buy,
-            reduce_only: false,
+            reduce_only: closing && asset.is_perp(),
             limit_px,
             sz,
             cloid: None,
@@ -145,36 +152,26 @@ pub fn place_order(symbol: &str, amount: i32, limit: f64) -> Result<(i32, f64, i
     }
 }
 
-/// Decimal places Hyperliquid allows for order sizes on `symbol`'s base asset.
-async fn spot_sz_decimals(info: &InfoClient, symbol: &str) -> Result<u32, String> {
-    let spot_meta = info
-        .spot_meta()
-        .await
-        .map_err(|e| format!("spot_meta failed: {e}"))?;
-    let asset = spot_meta
-        .universe
-        .iter()
-        .find(|a| a.name == symbol)
-        .ok_or_else(|| format!("{symbol} not found in spot_meta universe"))?;
-    let base_token = spot_meta
-        .tokens
-        .iter()
-        .find(|t| t.index == asset.tokens[0])
-        .ok_or_else(|| format!("base token for {symbol} not found"))?;
-    Ok(base_token.sz_decimals as u32)
+/// Resolves `symbol` to its universe and precision, caching the result --
+/// otherwise every order pays for a `meta()`/`spot_meta()` round-trip.
+pub(crate) async fn resolve_asset(info: &InfoClient, symbol: &str) -> Result<AssetInfo, String> {
+    if let Some(cached) = state::cached_asset(symbol) {
+        return Ok(cached);
+    }
+    let resolved = assets::fetch(info, symbol).await?;
+    state::cache_asset(symbol, resolved.clone());
+    Ok(resolved)
 }
 
-/// Slippage-adjusted limit price for an IOC "market" order, rounded to 5
-/// significant figures / `8 - sz_decimals` decimals (mirrors the SDK's
-/// private rule, but via `spot_meta()` so it works for spot pairs too).
-async fn marketable_spot_price(
+/// Slippage-adjusted price for an IOC "market" order, rounded to whatever
+/// the asset's universe allows.
+async fn marketable_price(
     info: &InfoClient,
     symbol: &str,
+    asset: &AssetInfo,
     is_buy: bool,
     slippage: f64,
 ) -> Result<f64, String> {
-    let price_decimals = 8u32.saturating_sub(spot_sz_decimals(info, symbol).await?);
-
     let mids = info
         .all_mids()
         .await
@@ -186,20 +183,7 @@ async fn marketable_spot_price(
         .map_err(|_| format!("bad mid price for {symbol}"))?;
 
     let slipped = mid * if is_buy { 1.0 + slippage } else { 1.0 - slippage };
-    Ok(round_to_significant_and_decimal(slipped, 5, price_decimals))
-}
-
-fn round_to_decimals(value: f64, decimals: u32) -> f64 {
-    let factor = 10f64.powi(decimals as i32);
-    (value * factor).round() / factor
-}
-
-fn round_to_significant_and_decimal(value: f64, sig_figs: u32, max_decimals: u32) -> f64 {
-    let abs_value = value.abs();
-    let magnitude = abs_value.log10().floor() as i32;
-    let scale = 10f64.powi(sig_figs as i32 - magnitude - 1);
-    let rounded = (abs_value * scale).round() / scale;
-    round_to_decimals(rounded.copysign(value), max_decimals)
+    Ok(assets::round_price(slipped, asset))
 }
 
 /// Cancels a resting order by its Zorro trade id. Backs DO_CANCEL.
@@ -229,8 +213,8 @@ pub fn cancel_order(zorro_id: i32) -> Result<(), String> {
     }
 }
 
-/// Status of a previously placed order: `(open_price, close_price, cost,
-/// profit, fill_state)`; `fill_state` follows BrokerTrade's contract.
+/// Status of a tracked order: `(open_price, close_price, cost, profit,
+/// fill_state)`; `fill_state` follows BrokerTrade's contract.
 pub fn trade_status(zorro_id: i32) -> Option<(f64, f64, f64, f64, i32)> {
     let plugin = state::get()?;
     let info = state::get_trade(zorro_id)?;
@@ -261,30 +245,78 @@ pub fn trade_status(zorro_id: i32) -> Option<(f64, f64, f64, f64, i32)> {
     Some((info.entry_price, close_price, 0.0, profit, fill_state))
 }
 
-/// `(balance, trade_val, margin_val)` for `BrokerAccount`. Spot has no
-/// margin; `trade_val` is USDC locked in resting orders.
+/// `(balance, trade_val, margin_val)` for `BrokerAccount`.
+///
+/// The perp account is the meaningful one once positions exist: account
+/// value already includes unrealized P&L, and margin in use is what limits
+/// further trading. Spot USDC sitting outside the perp wallet is added on
+/// so a spot-only account still reports a balance.
 pub fn account_balance() -> Option<(f64, f64, f64)> {
     let plugin = state::get()?;
-    let resp = runtime::get()
-        .block_on(plugin.info_client.user_token_balances(plugin.address))
-        .ok()?;
-    let usdc = resp.balances.iter().find(|b| b.coin == "USDC")?;
-    let total: f64 = usdc.total.parse().ok()?;
-    let hold: f64 = usdc.hold.parse().unwrap_or(0.0);
-    Some((total, hold, 0.0))
+    let (state_resp, token_resp) = runtime::get().block_on(async {
+        let a = plugin.info_client.user_state(plugin.address).await;
+        let b = plugin.info_client.user_token_balances(plugin.address).await;
+        (a, b)
+    });
+
+    let spot_usdc = token_resp
+        .ok()
+        .and_then(|r| {
+            r.balances
+                .iter()
+                .find(|b| b.coin == "USDC")
+                .and_then(|b| b.total.parse::<f64>().ok())
+        })
+        .unwrap_or(0.0);
+
+    let Ok(user_state) = state_resp else {
+        // perp account unreadable -- a spot-only balance is still useful
+        return Some((spot_usdc, 0.0, 0.0));
+    };
+    let account_value: f64 = user_state.margin_summary.account_value.parse().unwrap_or(0.0);
+    let margin_used: f64 = user_state
+        .margin_summary
+        .total_margin_used
+        .parse()
+        .unwrap_or(0.0);
+    let unrealized: f64 = user_state
+        .asset_positions
+        .iter()
+        .filter_map(|p| p.position.unrealized_pnl.parse::<f64>().ok())
+        .sum();
+
+    Some((account_value + spot_usdc, unrealized, margin_used))
 }
 
-/// Actual held base-asset quantity for `symbol`, from Hyperliquid directly
-/// (not Zorro's process-local trade bookkeeping). Backs GET_POSITION.
-/// `0.0` (not `None`) for "no position".
+/// Net position for `symbol`, read from Hyperliquid rather than Zorro's
+/// process-local bookkeeping, so it survives a restart. Backs GET_POSITION.
+///
+/// **Signed**: a perp short is negative. Spot holdings cannot go below zero.
+/// `0.0` (not `None`) means "no position".
 pub fn net_position(symbol: &str) -> Option<f64> {
     let plugin = state::get()?;
+    let asset = runtime::get()
+        .block_on(resolve_asset(&plugin.info_client, symbol))
+        .ok()?;
+
+    if asset.is_perp() {
+        let user_state = runtime::get()
+            .block_on(plugin.info_client.user_state(plugin.address))
+            .ok()?;
+        return Some(
+            user_state
+                .asset_positions
+                .iter()
+                .find(|p| p.position.coin == symbol)
+                .and_then(|p| p.position.szi.parse::<f64>().ok())
+                .unwrap_or(0.0),
+        );
+    }
+
+    // spot: the held quantity of the pair's base token
     let spot_meta = runtime::get().block_on(plugin.info_client.spot_meta()).ok()?;
-    let asset = spot_meta.universe.iter().find(|a| a.name == symbol)?;
-    let base_token = spot_meta
-        .tokens
-        .iter()
-        .find(|t| t.index == asset.tokens[0])?;
+    let pair = spot_meta.universe.iter().find(|a| a.name == symbol)?;
+    let base_token = spot_meta.tokens.iter().find(|t| t.index == pair.tokens[0])?;
     let balances = runtime::get()
         .block_on(plugin.info_client.user_token_balances(plugin.address))
         .ok()?;
@@ -296,6 +328,66 @@ pub fn net_position(symbol: &str) -> Option<f64> {
             .and_then(|b| b.total.parse::<f64>().ok())
             .unwrap_or(0.0),
     )
+}
+
+/// Margin a single lot ties up, for `BrokerAsset`. Spot posts the full
+/// notional; a perp posts notional divided by its leverage.
+pub fn margin_cost_per_lot(symbol: &str, price: f64) -> f64 {
+    let notional_per_lot = price / AMOUNT_SCALE;
+    let Some(plugin) = state::get() else {
+        return notional_per_lot;
+    };
+    let Ok(asset) = runtime::get().block_on(resolve_asset(&plugin.info_client, symbol)) else {
+        return notional_per_lot;
+    };
+    if !asset.is_perp() {
+        return notional_per_lot;
+    }
+    let leverage = current_leverage(symbol).unwrap_or(1).max(1);
+    notional_per_lot / leverage as f64
+}
+
+/// Leverage Hyperliquid currently has set for an open perp position.
+fn current_leverage(symbol: &str) -> Option<u32> {
+    let plugin = state::get()?;
+    let user_state = runtime::get()
+        .block_on(plugin.info_client.user_state(plugin.address))
+        .ok()?;
+    user_state
+        .asset_positions
+        .iter()
+        .find(|p| p.position.coin == symbol)
+        .map(|p| p.position.leverage.value)
+}
+
+/// Sets leverage for a perp. Backs Zorro's SET_LEVERAGE.
+pub fn set_leverage(symbol: &str, leverage: u32) -> Result<(), String> {
+    let plugin = state::get().ok_or("not logged in")?;
+    if leverage == 0 {
+        return Err("leverage must be at least 1".to_string());
+    }
+    let response = runtime::get().block_on(async {
+        let asset = resolve_asset(&plugin.info_client, symbol).await?;
+        if !asset.is_perp() {
+            return Err(format!("{symbol} is a spot asset and has no leverage"));
+        }
+        if leverage > asset.max_leverage {
+            return Err(format!(
+                "leverage {leverage} exceeds the maximum of {} for {symbol}",
+                asset.max_leverage
+            ));
+        }
+        plugin
+            .exchange_client
+            .update_leverage(leverage, symbol, true, None) // cross margin
+            .await
+            .map_err(|e| format!("update_leverage failed: {e}"))
+    })?;
+
+    match response {
+        ExchangeResponseStatus::Err(e) => Err(format!("leverage rejected: {e}")),
+        ExchangeResponseStatus::Ok(_) => Ok(()),
+    }
 }
 
 /// Last ask price for `symbol` via `all_mids`.

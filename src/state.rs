@@ -11,6 +11,8 @@ use std::sync::{Mutex, OnceLock, RwLock};
 use alloy::primitives::Address;
 use hyperliquid_rust_sdk::{ExchangeClient, InfoClient};
 
+use crate::assets::AssetInfo;
+
 pub type ErrorFn = unsafe extern "C" fn(*const c_char) -> c_int;
 pub type ProgressFn = unsafe extern "C" fn(c_int) -> c_int;
 
@@ -29,6 +31,9 @@ pub struct PluginState {
     pub exchange_client: ExchangeClient,
     pub address: Address,
     trades: Mutex<HashMap<i32, TradeInfo>>,
+    /// Symbol -> universe/precision, so an order doesn't pay for a `meta()`
+    /// round-trip. Cleared with the session, since it is network-specific.
+    assets: Mutex<HashMap<String, AssetInfo>>,
 }
 
 static CALLBACKS: OnceLock<Callbacks> = OnceLock::new();
@@ -50,6 +55,18 @@ pub fn set_order_type(order_type: i32) {
 
 pub fn order_type() -> i32 {
     ORDER_TYPE.load(Ordering::Relaxed)
+}
+
+// Asset named by the last SET_SYMBOL, which scopes commands like
+// SET_LEVERAGE that carry no symbol of their own.
+static SYMBOL: Mutex<Option<String>> = Mutex::new(None);
+
+pub fn set_symbol(symbol: &str) {
+    *SYMBOL.lock().unwrap_or_else(|e| e.into_inner()) = Some(symbol.to_string());
+}
+
+pub fn symbol() -> Option<String> {
+    SYMBOL.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
 struct Callbacks {
@@ -87,6 +104,7 @@ pub fn init(info_client: InfoClient, exchange_client: ExchangeClient, address: A
         exchange_client,
         address,
         trades: Mutex::new(HashMap::new()),
+        assets: Mutex::new(HashMap::new()),
     }));
     *PLUGIN.write().unwrap_or_else(|e| e.into_inner()) = Some(state);
 }
@@ -119,6 +137,25 @@ pub fn register_trade(coin: &str, oid: u64, is_buy: bool, entry_price: f64, entr
         );
     }
     id
+}
+
+pub fn cached_asset(symbol: &str) -> Option<AssetInfo> {
+    get()?
+        .assets
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(symbol)
+        .cloned()
+}
+
+pub fn cache_asset(symbol: &str, info: AssetInfo) {
+    if let Some(plugin) = get() {
+        plugin
+            .assets
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(symbol.to_string(), info);
+    }
 }
 
 pub fn get_trade(zorro_id: i32) -> Option<TradeInfo> {
