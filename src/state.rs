@@ -24,6 +24,11 @@ pub struct TradeInfo {
     pub is_buy: bool,
     pub entry_price: f64,
     pub entry_sz: f64,
+    /// Size still open. Drops as partial closes fill; a trade is only
+    /// retired when this reaches zero, not when one close fills.
+    pub remaining_sz: f64,
+    /// Set once closed; order status alone never reports that.
+    pub closed: bool,
 }
 
 pub struct PluginState {
@@ -133,10 +138,78 @@ pub fn register_trade(coin: &str, oid: u64, is_buy: bool, entry_price: f64, entr
                 is_buy,
                 entry_price,
                 entry_sz,
+                remaining_sz: entry_sz,
+                closed: false,
             },
         );
     }
     id
+}
+
+/// Books `qty` as closed and returns what is still open. The trade is
+/// marked closed only once nothing remains -- a partial close that fills
+/// its requested amount does not retire the trade.
+pub fn reduce_trade(zorro_id: i32, qty: f64) -> f64 {
+    let Some(plugin) = get() else { return 0.0 };
+    let mut trades = plugin.trades.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(info) = trades.get_mut(&zorro_id) else { return 0.0 };
+    let (remaining, flat) = apply_close(info.remaining_sz, info.entry_sz, qty);
+    info.remaining_sz = remaining;
+    info.closed = flat;
+    remaining
+}
+
+/// `(remaining, is_flat)` after closing `qty` of a trade. Split out so the
+/// rule can be tested without a session.
+fn apply_close(remaining_sz: f64, entry_sz: f64, qty: f64) -> (f64, bool) {
+    let remaining = (remaining_sz - qty).max(0.0);
+    // tolerance so float dust can't keep a flat trade open forever
+    if remaining <= entry_sz * 1e-6 {
+        (0.0, true)
+    } else {
+        (remaining, false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::apply_close;
+
+    /// Overfilling one chunk must not retire a trade that still holds more:
+    /// doing so made Zorro drop a position with a third of it still open.
+    #[test]
+    fn a_chunk_filling_in_full_does_not_retire_the_trade() {
+        let entry = 0.28625;
+        let (rem, flat) = apply_close(entry, entry, 0.11);
+        assert!(!flat, "trade retired with {rem} still open");
+        let (rem, flat) = apply_close(rem, entry, 0.09); // filled more than asked
+        assert!(!flat, "trade retired with {rem} still open");
+        assert!((rem - 0.08625).abs() < 1e-9, "expected 0.08625, got {rem}");
+    }
+
+    #[test]
+    fn closing_everything_retires_the_trade() {
+        let entry = 0.28625;
+        let (rem, flat) = apply_close(entry, entry, entry);
+        assert!(flat);
+        assert_eq!(rem, 0.0);
+    }
+
+    #[test]
+    fn overshoot_clamps_at_zero() {
+        let entry = 0.5;
+        let (rem, flat) = apply_close(entry, entry, 10.0);
+        assert!(flat);
+        assert_eq!(rem, 0.0);
+    }
+
+    #[test]
+    fn float_dust_counts_as_flat() {
+        let entry = 1.0;
+        let (rem, flat) = apply_close(1e-12, entry, 0.0);
+        assert!(flat, "a speck left by rounding should not keep it open");
+        assert_eq!(rem, 0.0);
+    }
 }
 
 pub fn cached_asset(symbol: &str) -> Option<AssetInfo> {

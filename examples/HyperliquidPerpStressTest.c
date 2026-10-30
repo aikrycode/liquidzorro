@@ -53,8 +53,9 @@
 #define PH_LIMIT_POLL   11
 #define PH_LIMIT_CANCEL 12
 #define PH_REJECT       13
-#define PH_REPORT       14
-#define PH_DONE         15
+#define PH_FLATTEN      14
+#define PH_REPORT       15
+#define PH_DONE         16
 
 int Phase;
 int Passed, Failed;
@@ -63,6 +64,7 @@ var PositionBeforeReject;
 int LimitTradeID;
 int LimitPollsLeft;
 int LimitCancelled;
+int FlattenTriesLeft;
 
 void check(string Name, int Ok)
 {
@@ -90,9 +92,11 @@ var dustLots()
 	return DUST_USD/Price*AMOUNT_SCALE;
 }
 
-int isFlat(var Lots)
+// Parameter is not named Lots: that is a predefined Zorro variable and
+// using it here expands the macro into the declaration.
+int isFlat(var PositionLots)
 {
-	return abs(Lots) <= dustLots();
+	return abs(PositionLots) <= dustLots();
 }
 
 var lotsFor(var Usd)
@@ -344,23 +348,55 @@ function run()
 		Lots = ceil(2.0/Price*AMOUNT_SCALE);   // ~$2: under the minimum
 		enterLong();
 		printf("\nUndersized order submitted (expect a clean rejection above)");
+		FlattenTriesLeft = 3;
+		Phase = PH_FLATTEN;
+		return;
+	}
+
+	///////////////////////////////////////////////////////////////////////
+	// Leave the account flat before stopping: cancel anything resting and
+	// close any exposure still open, retrying a few times since an IOC
+	// close can fill partially. Doing it here rather than leaving it to
+	// [Stop] means the exchange is verifiably flat while the script can
+	// still report on it.
+	///////////////////////////////////////////////////////////////////////
+	if(Phase == PH_FLATTEN) {
+		var Held = heldLots();
+		int Acted = 0;
+
+		// A cancelled order still sits in Zorro's book holding zero lots;
+		// skip that one, it is already gone on the exchange.
+		for(open_trades) {
+			if(TradeLots == 0 && !(TradeID == LimitTradeID && LimitCancelled)) {
+				printf("\nCancelling resting order, trade id %d", TradeID);
+				if(brokerCommand(CMD_DO_CANCEL, TradeID) == 1) Acted++;
+			}
+		}
+
+		if(!isFlat(Held)) {
+			printf("\nClosing residual position: %.0f lots", Held);
+			if(Held > 0) exitLong();
+			else exitShort();
+			Acted++;
+		}
+
+		FlattenTriesLeft--;
+		if(Acted > 0 && FlattenTriesLeft > 0) return;   // settle, then re-check
+
 		Phase = PH_REPORT;
 		return;
 	}
 
 	if(Phase == PH_REPORT) {
 		var EndBalance, Held;
-		int Stranded = 0;
+		int Resting = 0;
 
-		// Never leave a resting order holding collateral. A cancelled order
-		// still sits in Zorro's book with zero lots, so skip that one.
+		// PH_FLATTEN has already cancelled and closed; anything still here
+		// resisted it.
 		for(open_trades) {
-			if(TradeLots == 0 && !(TradeID == LimitTradeID && LimitCancelled)) {
-				printf("\nCancelling stranded order, trade id %d", TradeID);
-				if(brokerCommand(CMD_DO_CANCEL, TradeID) == 1) Stranded++;
-			}
+			if(TradeLots == 0 && !(TradeID == LimitTradeID && LimitCancelled)) Resting++;
 		}
-		check("No resting orders left behind", Stranded == 0);
+		check("No resting orders left behind", Resting == 0);
 
 		EndBalance = Balance;
 		Held = heldLots();
@@ -381,7 +417,12 @@ function run()
 		return;
 	}
 
+	// Safe to quit here: quit() force-closes open trades, and PH_FLATTEN
+	// has already cancelled every resting order and closed every position,
+	// with PH_REPORT confirming the exchange is flat. The only entry left
+	// in Zorro's book is the cancelled limit order, holding zero lots.
 	if(Phase == PH_DONE) {
-		if(once(1)) printf("\nPerpetual stress test complete -- press [Stop].");
+		printf("\nPerpetual stress test complete -- stopping.");
+		quit("Perpetual stress test complete");
 	}
 }

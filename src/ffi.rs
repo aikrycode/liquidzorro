@@ -175,7 +175,12 @@ pub unsafe extern "C" fn BrokerAsset(
             *p_pip = 1.0;
         }
         if !p_pip_cost.is_null() {
-            *p_pip_cost = 1.0;
+            // Value of one pip per lot. Zorro computes profit as
+            // priceDiff * Lots * PipCost / Pip, and a lot is 1/AMOUNT_SCALE
+            // of a coin, so the ratio has to equal that lot size. It also
+            // feeds Leverage = price / MarginCost * PipCost / Pip, which
+            // Zorro sends straight back via SET_LEVERAGE.
+            *p_pip_cost = 1.0 / bridge::AMOUNT_SCALE;
         }
         if !p_min_amount.is_null() {
             *p_min_amount = 0.0;
@@ -306,6 +311,67 @@ pub unsafe extern "C" fn BrokerBuy2(
     })
 }
 
+/// Closes one trade. Zorro requires this on non-NFA accounts; without it it
+/// refuses to close at all ("Error 075"). `amount` is signed by the trade's
+/// direction, so the closing order goes the other way. Returns the trade id,
+/// or 0 if unknown or the close failed.
+#[no_mangle]
+pub unsafe extern "C" fn BrokerSell2(
+    trade_id: c_int,
+    amount: c_int,
+    limit: f64,
+    p_close: *mut f64,
+    p_cost: *mut f64,
+    p_profit: *mut f64,
+    p_fill: *mut c_int,
+) -> c_int {
+    guard("BrokerSell2", 0, || {
+        let Some(info) = state::get_trade(trade_id) else {
+            state::log_message(&format!("BrokerSell2({trade_id}): unknown trade id"));
+            return 0;
+        };
+        if amount == 0 {
+            state::log_message(&format!("BrokerSell2({trade_id}): nothing to close"));
+            return 0;
+        }
+
+        let symbol = info.coin.clone();
+        match bridge::place_order(&symbol, -amount, limit, true) {
+            Ok((_, price, fill)) => {
+                let closed_qty = fill.unsigned_abs() as f64 / bridge::AMOUNT_SCALE;
+                let direction = if info.is_buy { 1.0 } else { -1.0 };
+                let profit = direction * (price - info.entry_price) * closed_qty;
+
+                if !p_close.is_null() {
+                    *p_close = price;
+                }
+                if !p_cost.is_null() {
+                    *p_cost = 0.0; // funding not attributed per trade yet
+                }
+                if !p_profit.is_null() {
+                    *p_profit = profit;
+                }
+                if !p_fill.is_null() {
+                    *p_fill = fill.abs();
+                }
+
+                // Measured against what is left of the trade, not against
+                // the amount asked for: a chunk can fill in full while the
+                // trade still holds more.
+                let remaining = state::reduce_trade(trade_id, closed_qty);
+                state::log_message(&format!(
+                    "BrokerSell2: {symbol} trade {trade_id}, filled={fill} @ {price}, profit={profit:.4}, {remaining} left"
+                ));
+                trade_id
+            }
+            Err(e) => {
+                state::log_message(&format!("BrokerSell2({trade_id}) FAILED: {e}"));
+                0
+            }
+        }
+    })
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn BrokerTrade(
     trade_id: c_int,
@@ -335,9 +401,8 @@ pub unsafe extern "C" fn BrokerTrade(
     })
 }
 
-/// GET_COMPLIANCE: NFA-restriction query. `2` means no NFA restrictions,
-/// matching the sample plugins; a lower value makes Zorro refuse to close
-/// trades with "Error 075".
+/// GET_COMPLIANCE: restriction bitmask -- 1 no partial closing, 2 no
+/// hedging, 4 FIFO, 8 no closing, 15 full NFA. Hyperliquid imposes none.
 const GET_COMPLIANCE: c_int = 51;
 
 /// GET_POSITION: real held balance for the symbol in `parameter` (`char*`),
@@ -373,7 +438,7 @@ const SET_LEVERAGE: c_int = 140;
 #[no_mangle]
 pub unsafe extern "C" fn BrokerCommand(command: c_int, parameter: isize) -> f64 {
     guard("BrokerCommand", 0.0, || match command {
-        GET_COMPLIANCE => 2.0,
+        GET_COMPLIANCE => 0.0,
         GET_BROKERZONE => 0.0, // UTC
         GET_MAXTICKS => 5000.0,
         SET_ORDERTYPE => {

@@ -2,6 +2,9 @@
 //! dynamically, each export called by its real C signature with real raw
 //! pointers and callbacks -- exercises the actual FFI boundary, not just
 //! our Rust functions directly.
+//!
+//! Run `cargo build` first: `cargo test` does not always rebuild the
+//! cdylib, so this can otherwise load a stale DLL and pass against it.
 
 use std::ffi::{c_void, CStr, CString};
 use std::os::raw::{c_char, c_int};
@@ -32,6 +35,15 @@ type BrokerAccountFn = unsafe extern "C" fn(*mut c_char, *mut f64, *mut f64, *mu
 type BrokerBuy2Fn =
     unsafe extern "C" fn(*mut c_char, c_int, f64, f64, *mut f64, *mut c_int) -> c_int;
 type BrokerTradeFn = unsafe extern "C" fn(c_int, *mut f64, *mut f64, *mut f64, *mut f64) -> c_int;
+type BrokerSell2Fn = unsafe extern "C" fn(
+    c_int,
+    c_int,
+    f64,
+    *mut f64,
+    *mut f64,
+    *mut f64,
+    *mut c_int,
+) -> c_int;
 type BrokerCommandFn = unsafe extern "C" fn(c_int, isize) -> f64;
 
 /// Mirrors `ffi::T6`'s layout without depending on the lib crate.
@@ -98,6 +110,7 @@ fn drives_every_export_like_zorro_would() {
         let broker_account: Symbol<BrokerAccountFn> = lib.get(b"BrokerAccount\0").unwrap();
         let broker_buy2: Symbol<BrokerBuy2Fn> = lib.get(b"BrokerBuy2\0").unwrap();
         let broker_trade: Symbol<BrokerTradeFn> = lib.get(b"BrokerTrade\0").unwrap();
+        let broker_sell2: Symbol<BrokerSell2Fn> = lib.get(b"BrokerSell2\0").unwrap();
         let broker_command: Symbol<BrokerCommandFn> = lib.get(b"BrokerCommand\0").unwrap();
 
         // BrokerOpen: real callback function pointers, real output buffer.
@@ -205,6 +218,22 @@ fn drives_every_export_like_zorro_would() {
         let (mut open, mut close, mut cost, mut profit) = (f64::MIN, f64::MIN, f64::MIN, f64::MIN);
         let rc = broker_trade(100_000, &mut open, &mut close, &mut cost, &mut profit);
         assert_eq!(rc, -999_997, "expected the NAY sentinel for an unknown trade id");
+
+        // BrokerSell2 across the real ABI: 7 args, 4 out-pointers.
+        let (mut sclose, mut scost, mut sprofit) = (f64::MIN, f64::MIN, f64::MIN);
+        let mut sfill: c_int = -1;
+        let rc = broker_sell2(
+            100_000, 650, 0.0, &mut sclose, &mut scost, &mut sprofit, &mut sfill,
+        );
+        assert_eq!(rc, 0, "BrokerSell2 should return 0 for an unknown trade id");
+        let err = take_last_error().expect("expected a BrokerSell2 message");
+        assert!(err.contains("BrokerSell2"), "unexpected message: {err}");
+
+        // amount 0 is rejected before any order is attempted
+        let rc = broker_sell2(
+            100_000, 0, 0.0, &mut sclose, &mut scost, &mut sprofit, &mut sfill,
+        );
+        assert_eq!(rc, 0, "BrokerSell2 should reject a zero amount");
 
         let rc = broker_command(0, 0);
         assert_eq!(rc, 0.0);

@@ -218,6 +218,13 @@ pub fn cancel_order(zorro_id: i32) -> Result<(), String> {
 pub fn trade_status(zorro_id: i32) -> Option<(f64, f64, f64, f64, i32)> {
     let plugin = state::get()?;
     let info = state::get_trade(zorro_id)?;
+
+    // -1 = completely closed. Hyperliquid reports a filled order as "filled"
+    // forever, so the flag is the only way Zorro learns the trade is gone.
+    if info.closed {
+        return Some((info.entry_price, info.entry_price, 0.0, 0.0, -1));
+    }
+
     let status = runtime::get()
         .block_on(plugin.info_client.query_order_by_oid(plugin.address, info.oid))
         .ok()?;
@@ -231,7 +238,12 @@ pub fn trade_status(zorro_id: i32) -> Option<(f64, f64, f64, f64, i32)> {
     let (fill_state, filled_sz) = match status.order {
         None => (-1, info.entry_sz), // no longer tracked -> treat as closed
         Some(order_info) => match order_info.status.as_str() {
-            "filled" => ((info.entry_sz * AMOUNT_SCALE).round() as i32, info.entry_sz),
+            // Report what is still open, not the original fill: partial
+            // closes shrink the trade and Zorro tracks it by this number.
+            "filled" => (
+                (info.remaining_sz * AMOUNT_SCALE).round() as i32,
+                info.remaining_sz,
+            ),
             "canceled" | "rejected" | "marginCanceled" => (NAY - 1, 0.0),
             _ => {
                 let remaining: f64 = order_info.order.sz.parse().unwrap_or(info.entry_sz);
@@ -368,8 +380,15 @@ pub fn set_leverage(symbol: &str, leverage: u32) -> Result<(), String> {
     }
     let response = runtime::get().block_on(async {
         let asset = resolve_asset(&plugin.info_client, symbol).await?;
+        // Zorro sends this before every order, spot included. Spot is
+        // always 1x, so accept that quietly and only object to real
+        // leverage being asked of an unleveraged asset.
         if !asset.is_perp() {
-            return Err(format!("{symbol} is a spot asset and has no leverage"));
+            return if leverage <= 1 {
+                Ok(None)
+            } else {
+                Err(format!("{symbol} is spot and cannot use {leverage}x"))
+            };
         }
         if leverage > asset.max_leverage {
             return Err(format!(
@@ -381,12 +400,14 @@ pub fn set_leverage(symbol: &str, leverage: u32) -> Result<(), String> {
             .exchange_client
             .update_leverage(leverage, symbol, true, None) // cross margin
             .await
+            .map(Some)
             .map_err(|e| format!("update_leverage failed: {e}"))
     })?;
 
     match response {
-        ExchangeResponseStatus::Err(e) => Err(format!("leverage rejected: {e}")),
-        ExchangeResponseStatus::Ok(_) => Ok(()),
+        None => Ok(()), // spot: nothing to set
+        Some(ExchangeResponseStatus::Err(e)) => Err(format!("leverage rejected: {e}")),
+        Some(ExchangeResponseStatus::Ok(_)) => Ok(()),
     }
 }
 

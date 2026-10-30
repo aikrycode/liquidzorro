@@ -2,9 +2,12 @@
 // Exercises far more of the plugin than the buy/sell demo: account reads,
 // multiple assets, candle history, repeated market round trips with uneven
 // splits, a resting GTC limit order with cancellation, and a deliberately
-// rejected undersized order. Every check logs PASS/FAIL and the run ends
-// with a tally. Broker: Hyperliquid. User: blank. Password: your private
-// key. Demo = testnet. [Trade] mode only.
+// rejected undersized order. Positions close in several pieces through
+// exitLong, so each buy is retired by repeated partial closes. Every
+// check logs PASS/FAIL and the run ends with a tally.
+//
+// Broker: Hyperliquid. User: blank. Password: your private key.
+// Demo = testnet. [Trade] mode only.
 //
 // Budget: holds at most ~$57 of testnet USDC at once and loses only
 // spread/slippage (a few dollars across a full run). Aborts immediately if
@@ -71,12 +74,12 @@ var heldLots()
 	return brokerCommand(CMD_GET_POSITION, SymbolTrade);
 }
 
-// Hyperliquid spot has no shorting, so to the plugin this is just a sell.
-// Hedge = 2 stops Zorro reinterpreting it as a close of the open long.
-void sellViaShort(var SellLots)
+// Closes part of the open long through Zorro's own close path, which
+// reaches the plugin as BrokerSell2. Partial, so one buy is closed in
+// several pieces.
+void sellPart(var SellLots)
 {
-	Lots = SellLots;
-	enterShort();
+	exitLong(0, 0, SellLots);
 }
 
 // Guards the budget. Returns 1 if there is room to keep trading.
@@ -95,7 +98,9 @@ function run()
 	set(LOGFILE);
 	set(NFA|OFF);
 	SaveMode = 0;
-	Hedge = 2;
+	// Default hedging: closes go through Zorro's close path rather than
+	// being faked with an opposing entry.
+	Hedge = 0;
 
 	if(!is(TRADEMODE)) {
 		printf("\nUnsupported function: this test only runs in [Trade] mode.");
@@ -195,18 +200,18 @@ function run()
 		return;
 	}
 
-	if(Phase == PH_SELL_A) { sellViaShort(Chunk1); Phase = PH_SELL_B; return; }
-	if(Phase == PH_SELL_B) { sellViaShort(Chunk2); Phase = PH_SELL_C; return; }
-	if(Phase == PH_SELL_C) { sellViaShort(Chunk3); Phase = PH_SWEEP;  return; }
+	if(Phase == PH_SELL_A) { sellPart(Chunk1); Phase = PH_SELL_B; return; }
+	if(Phase == PH_SELL_B) { sellPart(Chunk2); Phase = PH_SELL_C; return; }
+	if(Phase == PH_SELL_C) { sellPart(Chunk3); Phase = PH_SWEEP;  return; }
 
 	if(Phase == PH_SWEEP) {
 		var Leftover = heldLots();
 		if(Leftover > DUST_THRESHOLD_LOTS) {
 			printf("\n[cycle %d] sweeping leftover: %.0f lots", Cycle+1, Leftover);
-			sellViaShort(Leftover);
+			sellPart(Leftover);
 			return;                            // re-check next tick
 		}
-		check("Three-way split closes the position", Leftover <= DUST_THRESHOLD_LOTS);
+		check("Partial closes retire the whole position", Leftover <= DUST_THRESHOLD_LOTS);
 		if(Leftover > 0) printf("\n        (dust remaining: %.0f lots)", Leftover);
 		Phase = PH_CYCLE_END;
 		return;
@@ -336,7 +341,12 @@ function run()
 		return;
 	}
 
+	// quit() force-closes whatever Zorro still has open, unlike [Stop] with
+	// AutoConfirm = 1. By here PH_SWEEP has flattened the exchange position
+	// and PH_REPORT has cancelled any resting order, so the only entry left
+	// is the cancelled limit order, holding zero lots and nothing to close.
 	if(Phase == PH_DONE) {
-		if(once(1)) printf("\nStress test complete -- press [Stop].");
+		printf("\nStress test complete -- stopping.");
+		quit("Spot stress test complete");
 	}
 }

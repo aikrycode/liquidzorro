@@ -144,6 +144,24 @@ mod tests {
         assert_eq!(round_price(1234.567, &perp(2)), 1234.6);
     }
 
+    /// Zorro derives both trade profit and Leverage from PipCost/Pip, and
+    /// that ratio has to equal the lot size. With PipCost 1 and Pip 1 it
+    /// read 1 instead of 1/AMOUNT_SCALE, so Zorro computed leverage
+    /// price/MarginCost = 100000 and sent that back via SET_LEVERAGE.
+    #[test]
+    fn pip_ratio_matches_lot_size() {
+        let pip = 1.0;
+        let pip_cost = 1.0 / crate::bridge::AMOUNT_SCALE;
+        let lot_size = 1.0 / crate::bridge::AMOUNT_SCALE;
+        assert_eq!(pip_cost / pip, lot_size);
+
+        // leverage Zorro infers, for a 1x spot lot: price/MarginCost * PipCost/Pip
+        let price = 2374.0;
+        let margin_cost = price / crate::bridge::AMOUNT_SCALE; // what BrokerAsset reports
+        let leverage = price / margin_cost * (pip_cost / pip);
+        assert!((leverage - 1.0).abs() < 1e-9, "expected 1x, got {leverage}");
+    }
+
     #[test]
     fn rounding_handles_zero_and_negatives() {
         assert_eq!(round_price(0.0, &perp(2)), 0.0);
