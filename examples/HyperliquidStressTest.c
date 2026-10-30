@@ -22,7 +22,12 @@
 #define HISTORY_BARS    50           // candles to pull via BrokerHistory2
 
 #define AMOUNT_SCALE    100000.
+// One exchange size step for HL_SYMBOL: HYPE trades in 0.01-coin
+// increments, which is 1000 lots. Less than this cannot be sold at
+// all, so it is the floor a close can reach, not a tolerance.
 #define DUST_THRESHOLD_LOTS 1000.
+// A sweep that stops making progress would otherwise retry forever.
+#define MAX_SWEEPS      3
 
 // BrokerCommand codes (trading.h)
 #define CMD_GET_POSITION   53
@@ -56,6 +61,7 @@ var PositionBeforeReject;
 int LimitTradeID;
 int LimitPollsLeft;
 int LimitCancelled;
+int SweepsLeft;
 
 void check(string Name, int Ok)
 {
@@ -202,17 +208,22 @@ function run()
 
 	if(Phase == PH_SELL_A) { sellPart(Chunk1); Phase = PH_SELL_B; return; }
 	if(Phase == PH_SELL_B) { sellPart(Chunk2); Phase = PH_SELL_C; return; }
-	if(Phase == PH_SELL_C) { sellPart(Chunk3); Phase = PH_SWEEP;  return; }
+	if(Phase == PH_SELL_C) { sellPart(Chunk3); SweepsLeft = MAX_SWEEPS; Phase = PH_SWEEP; return; }
 
 	if(Phase == PH_SWEEP) {
 		var Leftover = heldLots();
-		if(Leftover > DUST_THRESHOLD_LOTS) {
-			printf("\n[cycle %d] sweeping leftover: %.0f lots", Cycle+1, Leftover);
+		if(Leftover > DUST_THRESHOLD_LOTS && SweepsLeft > 0) {
+			SweepsLeft--;
+			printf("\n[cycle %d] sweeping leftover: %.0f lots (%d tries left)",
+				Cycle+1, Leftover, SweepsLeft);
 			sellPart(Leftover);
 			return;                            // re-check next tick
 		}
 		check("Partial closes retire the whole position", Leftover <= DUST_THRESHOLD_LOTS);
-		if(Leftover > 0) printf("\n        (dust remaining: %.0f lots)", Leftover);
+		if(Leftover > DUST_THRESHOLD_LOTS)
+			printf("\n        (gave up after %d sweeps)", MAX_SWEEPS);
+		else if(Leftover > 0)
+			printf("\n        (%.0f lots left, under one size step)", Leftover);
 		Phase = PH_CYCLE_END;
 		return;
 	}
@@ -335,7 +346,7 @@ function run()
 		if(Held > DUST_THRESHOLD_LOTS)
 			printf("\n!! WARNING: %.0f lots still held -- rerun to flatten", Held);
 		else if(Held > 0)
-			printf("\nDust remaining: %.0f lots (ignored)", Held);
+			printf("\nDust remaining: %.0f lots -- under one size step, unsellable", Held);
 
 		Phase = PH_DONE;
 		return;

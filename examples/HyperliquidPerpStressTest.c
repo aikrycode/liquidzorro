@@ -60,6 +60,7 @@
 int Phase;
 int Passed, Failed;
 var StartBalance;
+var MarginFlat;
 var PositionBeforeReject;
 int LimitTradeID;
 int LimitPollsLeft;
@@ -155,7 +156,7 @@ function run()
 		check("BrokerAccount reports a positive account value", StartBalance > 0);
 		if(!budgetOk()) { Phase = PH_REPORT; return; }
 		check("Balance covers the test budget", StartBalance >= MIN_BALANCE + TRADE_USD + LIMIT_USD);
-		check("Margin used is reported and not negative", MarginVal >= 0);
+		MarginFlat = MarginVal;   // baseline, so the long measures its own margin
 
 		Price = priceClose(0);
 		check("BrokerAsset prices the perpetual", Price > 0);
@@ -214,8 +215,16 @@ function run()
 
 	if(Phase == PH_CHECK_LONG) {
 		var Held = heldLots();
-		printf("\nPosition while long: %.0f lots", Held);
+		var Notional = Held/AMOUNT_SCALE*priceClose(0);
+		var Expected = Notional/MAX_LEVERAGE;
+		printf("\nPosition while long: %.0f lots (~$%.2f notional)", Held, Notional);
 		check("A long reports a positive position", Held > dustLots());
+		// At 1x the exchange locks up the whole notional. A wrong leverage
+		// reading shows up here as margin off by that factor.
+		printf("\nMargin used: %.2f (expected ~%.2f at %dx)",
+			MarginVal - MarginFlat, Expected, MAX_LEVERAGE);
+		check("Margin used matches the notional at this leverage",
+			abs(MarginVal - MarginFlat - Expected) < Expected*0.25);
 		Phase = PH_CLOSE_LONG;
 		return;
 	}
