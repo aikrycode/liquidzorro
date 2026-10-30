@@ -39,6 +39,10 @@ pub struct PluginState {
     /// Symbol -> universe/precision, so an order doesn't pay for a `meta()`
     /// round-trip. Cleared with the session, since it is network-specific.
     assets: Mutex<HashMap<String, AssetInfo>>,
+    /// Perp symbol -> leverage Hyperliquid has configured for this account.
+    /// Keeps `BrokerAsset` off the network on every call; filled on first
+    /// read and kept current by `SET_LEVERAGE`.
+    leverage: Mutex<HashMap<String, u32>>,
 }
 
 static CALLBACKS: OnceLock<Callbacks> = OnceLock::new();
@@ -110,6 +114,7 @@ pub fn init(info_client: InfoClient, exchange_client: ExchangeClient, address: A
         address,
         trades: Mutex::new(HashMap::new()),
         assets: Mutex::new(HashMap::new()),
+        leverage: Mutex::new(HashMap::new()),
     }));
     *PLUGIN.write().unwrap_or_else(|e| e.into_inner()) = Some(state);
 }
@@ -228,6 +233,25 @@ pub fn cache_asset(symbol: &str, info: AssetInfo) {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(symbol.to_string(), info);
+    }
+}
+
+pub fn cached_leverage(symbol: &str) -> Option<u32> {
+    get()?
+        .leverage
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(symbol)
+        .copied()
+}
+
+pub fn cache_leverage(symbol: &str, leverage: u32) {
+    if let Some(plugin) = get() {
+        plugin
+            .leverage
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(symbol.to_string(), leverage);
     }
 }
 
