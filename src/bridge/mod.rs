@@ -359,17 +359,26 @@ pub fn margin_cost_per_lot(symbol: &str, price: f64) -> f64 {
     notional_per_lot / leverage as f64
 }
 
-/// Leverage Hyperliquid currently has set for an open perp position.
+/// Leverage Hyperliquid has configured for this account on `symbol`.
+///
+/// Read from `active_asset_data`, which reports the setting whether or not
+/// a position is open -- the clearinghouse state lists only open positions,
+/// so sizing the first entry after a leverage change would use the default.
+/// Cached, because `BrokerAsset` asks on every call.
 fn current_leverage(symbol: &str) -> Option<u32> {
+    if let Some(cached) = state::cached_leverage(symbol) {
+        return Some(cached);
+    }
     let plugin = state::get()?;
-    let user_state = runtime::get()
-        .block_on(plugin.info_client.user_state(plugin.address))
+    let data = runtime::get()
+        .block_on(
+            plugin
+                .info_client
+                .active_asset_data(plugin.address, symbol.to_string()),
+        )
         .ok()?;
-    user_state
-        .asset_positions
-        .iter()
-        .find(|p| p.position.coin == symbol)
-        .map(|p| p.position.leverage.value)
+    state::cache_leverage(symbol, data.leverage.value);
+    Some(data.leverage.value)
 }
 
 /// Sets leverage for a perp. Backs Zorro's SET_LEVERAGE.
@@ -407,7 +416,10 @@ pub fn set_leverage(symbol: &str, leverage: u32) -> Result<(), String> {
     match response {
         None => Ok(()), // spot: nothing to set
         Some(ExchangeResponseStatus::Err(e)) => Err(format!("leverage rejected: {e}")),
-        Some(ExchangeResponseStatus::Ok(_)) => Ok(()),
+        Some(ExchangeResponseStatus::Ok(_)) => {
+            state::cache_leverage(symbol, leverage);
+            Ok(())
+        }
     }
 }
 

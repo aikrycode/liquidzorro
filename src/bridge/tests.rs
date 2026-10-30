@@ -350,3 +350,35 @@ fn flattens_leftover_balance() {
         println!("no {base_token} balance to flatten");
     }
 }
+
+/// Leverage must be visible with no position open: the clearinghouse state
+/// lists only open positions, so reading it there left `BrokerAsset`
+/// reporting 1x margin and Zorro under-sizing the first entry after a
+/// leverage change. Re-logs in between the two reads so the session cache
+/// is empty and the figure has to come back from the exchange.
+#[test]
+#[ignore]
+fn margin_reflects_leverage_while_flat() {
+    login(None, BaseUrl::Testnet).expect("login should succeed");
+    let price = asset_price(TEST_PERP).expect("perp price");
+    let full_notional = price / AMOUNT_SCALE;
+
+    set_leverage(TEST_PERP, 1).expect("1x should be accepted");
+    login(None, BaseUrl::Testnet).expect("re-login should succeed");
+    let at_one = margin_cost_per_lot(TEST_PERP, price);
+
+    set_leverage(TEST_PERP, 5).expect("5x should be accepted");
+    login(None, BaseUrl::Testnet).expect("re-login should succeed");
+    let at_five = margin_cost_per_lot(TEST_PERP, price);
+
+    set_leverage(TEST_PERP, 1).expect("leverage should be restored to 1x");
+
+    assert!(
+        (at_one - full_notional).abs() < full_notional * 1e-9,
+        "1x margin {at_one} should be the full notional {full_notional}"
+    );
+    assert!(
+        (at_five * 5.0 - at_one).abs() < at_one * 1e-9,
+        "5x margin {at_five} should be a fifth of {at_one}"
+    );
+}
