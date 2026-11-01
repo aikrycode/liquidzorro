@@ -382,3 +382,66 @@ fn margin_reflects_leverage_while_flat() {
         "5x margin {at_five} should be a fifth of {at_one}"
     );
 }
+
+/// A round trip must report what it actually cost. pProfit is gross by
+/// contract, so a fee of zero here means Zorro's P&L silently overstates
+/// every trade by the exchange's cut.
+#[test]
+#[ignore]
+fn a_round_trip_reports_the_fees_it_paid() {
+    login(None, BaseUrl::Testnet).expect("login should succeed");
+    let price = asset_price(TEST_PERP).expect("perp price");
+    let qty = minimum_qty(price);
+    let amount = (qty * AMOUNT_SCALE).round() as i32;
+
+    set_leverage(TEST_PERP, 1).expect("1x");
+    let (id, _, fill) = place_order(TEST_PERP, amount, 0.0, false).expect("open should fill");
+    assert!(fill != 0, "entry did not fill");
+
+    let entry_fee = state::get_trade(id).expect("trade").entry_fee;
+    println!("entry fee: {entry_fee}");
+    assert!(entry_fee > 0.0, "entry fee was never read back from the fills feed");
+
+    let (_, _, cost, _, _) = trade_status(id).expect("status while open");
+    println!("cost while open: {cost}");
+    assert!(cost < 0.0, "cost should be negative (money paid), got {cost}");
+
+    // Through close_trade, the path BrokerSell2 takes: the close is its own
+    // order, and its fee has to be booked against the trade it closed.
+    let outcome = close_trade(id, fill, 0.0).expect("close should fill");
+    println!("close fee: {}, cost: {}", outcome.fee, outcome.cost);
+    assert!(outcome.fee > 0.0, "the close reported no fee of its own");
+    assert!(outcome.cost < 0.0, "close cost should be negative, got {}", outcome.cost);
+
+    let total = state::get_trade(id).expect("trade").total_fees();
+    println!("total fees: {total}");
+    assert!(
+        total > entry_fee,
+        "closing added no fee: entry {entry_fee}, total {total}"
+    );
+}
+
+/// Diagnostic: prints every open perp position with its funding so far.
+/// Use it to confirm a live test left the account flat.
+#[test]
+#[ignore]
+fn shows_open_positions() {
+    login(None, BaseUrl::Testnet).expect("login should succeed");
+    let plugin = state::get().unwrap();
+    let user_state = runtime::get()
+        .block_on(plugin.info_client.user_state(plugin.address))
+        .expect("user_state should succeed");
+    if user_state.asset_positions.is_empty() {
+        println!("flat: no open positions");
+    }
+    for p in &user_state.asset_positions {
+        println!(
+            "{}: szi={} entry={:?} funding_since_open={}",
+            p.position.coin,
+            p.position.szi,
+            p.position.entry_px,
+            p.position.cum_funding.since_open
+        );
+    }
+    println!("margin used: {}", user_state.margin_summary.total_margin_used);
+}

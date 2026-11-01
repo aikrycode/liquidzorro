@@ -29,6 +29,22 @@ pub struct TradeInfo {
     pub remaining_sz: f64,
     /// Set once closed; order status alone never reports that.
     pub closed: bool,
+    /// Fee the entry fill cost, in USDC. Positive is money paid.
+    pub entry_fee: f64,
+    /// False until `entry_fee` has been read from the fills feed. A fill can
+    /// be acknowledged before it is indexed there, so the lookup is retried
+    /// rather than losing the fee.
+    pub entry_fee_final: bool,
+    /// Fees of the closes booked against this trade so far. Kept apart from
+    /// `entry_fee` so retrying the entry lookup cannot overwrite them.
+    pub close_fees: f64,
+}
+
+impl TradeInfo {
+    /// Every fee this trade has paid, entry and closes together.
+    pub fn total_fees(&self) -> f64 {
+        self.entry_fee + self.close_fees
+    }
 }
 
 pub struct PluginState {
@@ -145,10 +161,34 @@ pub fn register_trade(coin: &str, oid: u64, is_buy: bool, entry_price: f64, entr
                 entry_sz,
                 remaining_sz: entry_sz,
                 closed: false,
+                entry_fee: 0.0,
+                entry_fee_final: false,
+                close_fees: 0.0,
             },
         );
     }
     id
+}
+
+/// Records what the entry fill cost, and stops the lookup being retried.
+pub fn set_entry_fee(zorro_id: i32, fee: f64) {
+    with_trade(zorro_id, |info| {
+        info.entry_fee = fee;
+        info.entry_fee_final = true;
+    });
+}
+
+/// Books a close's fee against the trade it closed.
+pub fn add_close_fee(zorro_id: i32, fee: f64) {
+    with_trade(zorro_id, |info| info.close_fees += fee);
+}
+
+fn with_trade(zorro_id: i32, f: impl FnOnce(&mut TradeInfo)) {
+    let Some(plugin) = get() else { return };
+    let mut trades = plugin.trades.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(info) = trades.get_mut(&zorro_id) {
+        f(info);
+    }
 }
 
 /// Books `qty` as closed and returns what is still open. The trade is

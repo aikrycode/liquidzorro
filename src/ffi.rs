@@ -325,49 +325,30 @@ pub unsafe extern "C" fn BrokerSell2(
     p_profit: *mut f64,
     p_fill: *mut c_int,
 ) -> c_int {
-    guard("BrokerSell2", 0, || {
-        let Some(info) = state::get_trade(trade_id) else {
-            state::log_message(&format!("BrokerSell2({trade_id}): unknown trade id"));
-            return 0;
-        };
-        if amount == 0 {
-            state::log_message(&format!("BrokerSell2({trade_id}): nothing to close"));
-            return 0;
+    guard("BrokerSell2", 0, || match bridge::close_trade(trade_id, amount, limit) {
+        Ok(outcome) => {
+            if !p_close.is_null() {
+                *p_close = outcome.price;
+            }
+            if !p_cost.is_null() {
+                *p_cost = outcome.cost;
+            }
+            if !p_profit.is_null() {
+                *p_profit = outcome.profit;
+            }
+            if !p_fill.is_null() {
+                *p_fill = outcome.fill.abs();
+            }
+            state::log_message(&format!(
+                "BrokerSell2: {} trade {trade_id}, filled={} @ {}, profit={:.4}, fee={:.4}, {} left",
+                outcome.symbol, outcome.fill, outcome.price, outcome.profit, outcome.fee,
+                outcome.remaining
+            ));
+            trade_id
         }
-
-        let symbol = info.coin.clone();
-        match bridge::place_order(&symbol, -amount, limit, true) {
-            Ok((_, price, fill)) => {
-                let closed_qty = fill.unsigned_abs() as f64 / bridge::AMOUNT_SCALE;
-                let direction = if info.is_buy { 1.0 } else { -1.0 };
-                let profit = direction * (price - info.entry_price) * closed_qty;
-
-                if !p_close.is_null() {
-                    *p_close = price;
-                }
-                if !p_cost.is_null() {
-                    *p_cost = 0.0; // funding not attributed per trade yet
-                }
-                if !p_profit.is_null() {
-                    *p_profit = profit;
-                }
-                if !p_fill.is_null() {
-                    *p_fill = fill.abs();
-                }
-
-                // Measured against what is left of the trade, not against
-                // the amount asked for: a chunk can fill in full while the
-                // trade still holds more.
-                let remaining = state::reduce_trade(trade_id, closed_qty);
-                state::log_message(&format!(
-                    "BrokerSell2: {symbol} trade {trade_id}, filled={fill} @ {price}, profit={profit:.4}, {remaining} left"
-                ));
-                trade_id
-            }
-            Err(e) => {
-                state::log_message(&format!("BrokerSell2({trade_id}) FAILED: {e}"));
-                0
-            }
+        Err(e) => {
+            state::log_message(&format!("BrokerSell2({trade_id}) FAILED: {e}"));
+            0
         }
     })
 }

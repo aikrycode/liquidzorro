@@ -139,6 +139,9 @@ pub fn place_order(
             let price: f64 = order.avg_px.parse().unwrap_or(limit_px);
             let fill_sz: f64 = order.total_sz.parse().unwrap_or(sz);
             let zorro_id = state::register_trade(symbol, order.oid, is_buy, price, fill_sz);
+            if let Some(fee) = order_fees(order.oid) {
+                state::set_entry_fee(zorro_id, fee);
+            }
             Ok((zorro_id, price, (fill_sz * AMOUNT_SCALE).round() as i32))
         }
         // Resting: accepted but unfilled. Zorro reads fill 0 as a pending
@@ -213,6 +216,145 @@ pub fn cancel_order(zorro_id: i32) -> Result<(), String> {
     }
 }
 
+/// What closing part of a trade did, ready for `BrokerSell2`'s out-params.
+pub struct CloseOutcome {
+    pub symbol: String,
+    pub price: f64,
+    /// Signed as `place_order` reported it.
+    pub fill: i32,
+    pub profit: f64,
+    /// Negative is money paid: this trade's fees so far plus its funding.
+    pub cost: f64,
+    /// Fee of this close alone, for logging.
+    pub fee: f64,
+    /// Size of the trade still open afterwards.
+    pub remaining: f64,
+}
+
+/// Closes `amount` of a tracked trade and books what it cost against it.
+///
+/// Lives here rather than in `BrokerSell2` so the fee attribution is
+/// reachable without going through the C ABI: the close is placed as its
+/// own order, and its fee would otherwise be stranded on a bookkeeping
+/// entry Zorro never sees.
+pub fn close_trade(trade_id: i32, amount: i32, limit: f64) -> Result<CloseOutcome, String> {
+    let info = state::get_trade(trade_id).ok_or("unknown trade id")?;
+    if amount == 0 {
+        return Err("nothing to close".to_string());
+    }
+    let symbol = info.coin.clone();
+    let (close_id, price, fill) = place_order(&symbol, -amount, limit, true)?;
+
+    let closed_qty = fill.unsigned_abs() as f64 / AMOUNT_SCALE;
+    let direction = if info.is_buy { 1.0 } else { -1.0 };
+    let profit = direction * (price - info.entry_price) * closed_qty;
+
+    let fee = state::get_trade(close_id).map_or(0.0, |t| t.entry_fee);
+    state::add_close_fee(trade_id, fee);
+    let cost = -(state::get_trade(trade_id).map_or(fee, |t| t.total_fees())
+        + trade_funding(&symbol, closed_qty));
+
+    // Measured against what is left of the trade, not against the amount
+    // asked for: a chunk can fill in full while the trade still holds more.
+    let remaining = state::reduce_trade(trade_id, closed_qty);
+
+    Ok(CloseOutcome { symbol, price, fill, profit, cost, fee, remaining })
+}
+
+/// Fees the exchange charged for order `oid`, summed over its fills.
+/// `None` when the order has no fills in the feed yet -- a fill can be
+/// acknowledged before it is indexed, so the caller retries rather than
+/// booking zero.
+pub fn order_fees(oid: u64) -> Option<f64> {
+    let plugin = state::get()?;
+    let fills = runtime::get()
+        .block_on(plugin.info_client.user_fills(plugin.address))
+        .ok()?;
+    let mut fee = 0.0;
+    let mut seen = false;
+    for fill in fills.iter().filter(|f| f.oid == oid) {
+        fee += fill.fee.parse::<f64>().unwrap_or(0.0);
+        seen = true;
+    }
+    if seen { Some(fee) } else { None }
+}
+
+/// Funding this trade has paid, pro-rated by its share of the position.
+///
+/// Hyperliquid reports funding per position, not per order, so a position
+/// built from several Zorro trades would otherwise charge each of them the
+/// whole amount. Spot has no funding and reports zero.
+pub fn trade_funding(coin: &str, trade_sz: f64) -> f64 {
+    let Some(plugin) = state::get() else { return 0.0 };
+    // Spot pays no funding, so skip the round-trip that would find nothing.
+    if matches!(state::cached_asset(coin), Some(asset) if !asset.is_perp()) {
+        return 0.0;
+    }
+    let Ok(user_state) = runtime::get().block_on(plugin.info_client.user_state(plugin.address))
+    else {
+        return 0.0;
+    };
+    let Some(position) = user_state
+        .asset_positions
+        .iter()
+        .find(|p| p.position.coin == coin)
+    else {
+        return 0.0;
+    };
+    let since_open: f64 = position.position.cum_funding.since_open.parse().unwrap_or(0.0);
+    let position_sz = position.position.szi.parse::<f64>().unwrap_or(0.0).abs();
+    prorate_funding(since_open, position_sz, trade_sz)
+}
+
+/// This trade's share of a position's funding. Split out so the rule can be
+/// tested without a session.
+fn prorate_funding(since_open: f64, position_sz: f64, trade_sz: f64) -> f64 {
+    if position_sz <= 0.0 || trade_sz <= 0.0 {
+        return 0.0;
+    }
+    // Capped at the whole amount: a close can report more size than the
+    // position still shows once the reduce has settled.
+    since_open * (trade_sz / position_sz).min(1.0)
+}
+
+#[cfg(test)]
+mod funding_tests {
+    use super::prorate_funding;
+
+    #[test]
+    fn a_whole_position_pays_all_of_its_funding() {
+        assert_eq!(prorate_funding(0.42, 1.5, 1.5), 0.42);
+    }
+
+    /// Two trades sharing one position must not each be charged the full
+    /// amount -- that is double counting, not a rounding difference.
+    #[test]
+    fn trades_sharing_a_position_split_it() {
+        let a = prorate_funding(0.40, 2.0, 1.5);
+        let b = prorate_funding(0.40, 2.0, 0.5);
+        assert!((a - 0.30).abs() < 1e-12, "got {a}");
+        assert!((b - 0.10).abs() < 1e-12, "got {b}");
+        assert!((a + b - 0.40).abs() < 1e-12);
+    }
+
+    #[test]
+    fn a_closed_or_empty_position_pays_nothing() {
+        assert_eq!(prorate_funding(0.42, 0.0, 1.0), 0.0);
+        assert_eq!(prorate_funding(0.42, 1.0, 0.0), 0.0);
+    }
+
+    #[test]
+    fn a_share_over_the_position_is_capped() {
+        assert_eq!(prorate_funding(0.42, 1.0, 5.0), 0.42);
+    }
+
+    /// Funding received, not paid, keeps its sign through the split.
+    #[test]
+    fn received_funding_stays_negative() {
+        assert!((prorate_funding(-0.20, 2.0, 1.0) + 0.10).abs() < 1e-12);
+    }
+}
+
 /// Status of a tracked order: `(open_price, close_price, cost, profit,
 /// fill_state)`; `fill_state` follows BrokerTrade's contract.
 pub fn trade_status(zorro_id: i32) -> Option<(f64, f64, f64, f64, i32)> {
@@ -222,7 +364,8 @@ pub fn trade_status(zorro_id: i32) -> Option<(f64, f64, f64, f64, i32)> {
     // -1 = completely closed. Hyperliquid reports a filled order as "filled"
     // forever, so the flag is the only way Zorro learns the trade is gone.
     if info.closed {
-        return Some((info.entry_price, info.entry_price, 0.0, 0.0, -1));
+        // Costs survive the close: Zorro books them when it retires the trade.
+        return Some((info.entry_price, info.entry_price, -info.total_fees(), 0.0, -1));
     }
 
     let status = runtime::get()
@@ -254,7 +397,18 @@ pub fn trade_status(zorro_id: i32) -> Option<(f64, f64, f64, f64, i32)> {
     };
     let profit = direction * (close_price - info.entry_price) * filled_sz;
 
-    Some((info.entry_price, close_price, 0.0, profit, fill_state))
+    // Retry the fee lookup until the fills feed has caught up with the fill.
+    if !info.entry_fee_final && filled_sz > 0.0 {
+        if let Some(fee) = order_fees(info.oid) {
+            state::set_entry_fee(zorro_id, fee);
+        }
+    }
+    // pProfit is gross by contract ("without rollover and commission"), so
+    // fees and funding go out through pCost instead. Negative is money paid.
+    let fees = state::get_trade(zorro_id).map_or_else(|| info.total_fees(), |t| t.total_fees());
+    let cost = -(fees + trade_funding(&info.coin, filled_sz));
+
+    Some((info.entry_price, close_price, cost, profit, fill_state))
 }
 
 /// `(balance, trade_val, margin_val)` for `BrokerAccount`.
