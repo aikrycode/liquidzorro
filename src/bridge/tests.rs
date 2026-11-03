@@ -5,10 +5,14 @@
 
 use super::*;
 
-/// Spot pair the tests trade: HYPE/USDC, which Hyperliquid lists under its
-/// index rather than a friendly name. Liquid enough that a $10 order fills
-/// without meaningful slippage.
-const TEST_SPOT: &str = "@1035";
+/// Spot pair the tests trade: PURR/USDC, the canonical testnet pair, quoting
+/// around 1% with one whole coin -- about $4.50 -- as its size step, so a $12
+/// order is several steps wide.
+///
+/// Not HYPE/USDC ("@1035"): it quotes a ~22% spread, and its run from $188 to
+/// $5480 inside two hours put one 0.01-coin step at $54.80, so a $12 order
+/// rounded to zero size and was rejected outright.
+const TEST_SPOT: &str = "PURR/USDC";
 
 /// Perp the tests trade: liquid on testnet, with `sz_decimals` fine enough
 /// to reach the $10 minimum.
@@ -43,7 +47,7 @@ fn lists_spot_pairs() {
     }
 }
 
-/// `(pair_name, base_token_name)` for `TEST_SPOT`, e.g. `("@1035", "HYPE")`.
+/// `(pair_name, base_token_name)` for `TEST_SPOT`, e.g. `("PURR/USDC", "PURR")`.
 fn test_pair(plugin: &state::PluginState) -> (String, String) {
     let spot_meta = runtime::get()
         .block_on(plugin.info_client.spot_meta())
@@ -97,7 +101,7 @@ fn flatten_base_balance(plugin: &state::PluginState, pair_name: &str, base_token
     }
 
     let amount = (held * AMOUNT_SCALE).round() as i32;
-    match place_order(pair_name, -amount, 0.0, false) {
+    match place_order(pair_name, -amount, 0.0, false, 0.0) {
         Ok((_, px, fill)) => {
             println!("flattened {held} {base_token_name} @ {px} (filled {fill})");
             held
@@ -147,7 +151,7 @@ fn connects_and_reads_market_data() {
             .unwrap()
             .as_millis() as i64,
     );
-    let candles = history(&pair, now_ole, 60, 5);
+    let candles = history(&pair, 0.0, now_ole, 60, 5);
     println!("{pair} last 5 hourly candles: {candles:?}");
     assert!(candles.is_some(), "expected candle history for {pair}");
 }
@@ -170,7 +174,7 @@ fn places_and_closes_a_spot_order() {
     println!("{pair} price {price}, buying {real_qty} (~{:.2} USDC)", real_qty * price);
 
     let (trade_id, buy_price, buy_fill) =
-        place_order(&pair, units, 0.0, false).expect("buy order should succeed");
+        place_order(&pair, units, 0.0, false, 0.0).expect("buy order should succeed");
     println!("bought {buy_fill} {pair} @ {buy_price}, trade id {trade_id}");
     assert!(buy_fill > 0, "expected the IOC market buy to fill");
 
@@ -178,7 +182,7 @@ fn places_and_closes_a_spot_order() {
     println!("trade_status after buy: {status:?}");
 
     let (close_id, sell_price, sell_fill) =
-        place_order(&pair, -units, 0.0, true).expect("sell order should succeed");
+        place_order(&pair, -units, 0.0, true, 0.0).expect("sell order should succeed");
     println!("sold {sell_fill} {pair} @ {sell_price}, trade id {close_id}");
     assert!(sell_fill > 0, "expected the IOC market sell to fill");
 
@@ -216,7 +220,7 @@ fn rests_and_cancels_a_limit_order() {
     println!("{pair} mid {price}, resting a buy for {real_qty} @ {limit_px}");
 
     let (trade_id, rest_price, fill) =
-        place_order(&pair, units, limit_px, false).expect("limit order should be accepted");
+        place_order(&pair, units, limit_px, false, 0.0).expect("limit order should be accepted");
     assert_eq!(fill, 0, "a buy 40% below market must not fill");
     println!("resting as trade id {trade_id} @ {rest_price}");
 
@@ -290,7 +294,7 @@ fn opens_and_closes_a_perp_short() {
     let units = (qty * AMOUNT_SCALE).round() as i32;
     println!("{TEST_PERP} @ {price}, shorting {qty} (~{:.2} USDC)", qty * price);
 
-    let (id, fill_px, fill) = place_order(TEST_PERP, -units, 0.0, false).expect("short should open");
+    let (id, fill_px, fill) = place_order(TEST_PERP, -units, 0.0, false, 0.0).expect("short should open");
     assert!(fill > 0, "expected the short to fill");
     println!("short opened: {fill} @ {fill_px}, trade id {id}");
 
@@ -300,7 +304,7 @@ fn opens_and_closes_a_perp_short() {
 
     // closing=true -> reduce_only, so an oversized close flattens, never flips
     let (close_id, close_px, close_fill) =
-        place_order(TEST_PERP, units, 0.0, true).expect("short should close");
+        place_order(TEST_PERP, units, 0.0, true, 0.0).expect("short should close");
     println!("short closed: {close_fill} @ {close_px}, trade id {close_id}");
 
     let after = net_position(TEST_PERP).expect("net_position after close");
@@ -322,13 +326,13 @@ fn oversized_close_flattens_instead_of_flipping() {
     let qty = minimum_qty(price);
     let units = (qty * AMOUNT_SCALE).round() as i32;
 
-    place_order(TEST_PERP, units, 0.0, false).expect("long should open");
+    place_order(TEST_PERP, units, 0.0, false, 0.0).expect("long should open");
     let long = net_position(TEST_PERP).expect("net_position");
     assert!(long > 0.0, "expected a long, got {long}");
     println!("long open: {long}");
 
     // close with triple the size; reduce_only must cap it at flat
-    place_order(TEST_PERP, -units * 3, 0.0, true).expect("oversized close");
+    place_order(TEST_PERP, -units * 3, 0.0, true, 0.0).expect("oversized close");
     let after = net_position(TEST_PERP).expect("net_position after");
     println!("net position after 3x oversized close: {after}");
     assert!(
@@ -395,7 +399,7 @@ fn a_round_trip_reports_the_fees_it_paid() {
     let amount = (qty * AMOUNT_SCALE).round() as i32;
 
     set_leverage(TEST_PERP, 1).expect("1x");
-    let (id, _, fill) = place_order(TEST_PERP, amount, 0.0, false).expect("open should fill");
+    let (id, _, fill) = place_order(TEST_PERP, amount, 0.0, false, 0.0).expect("open should fill");
     assert!(fill != 0, "entry did not fill");
 
     let entry_fee = state::get_trade(id).expect("trade").entry_fee;
@@ -444,4 +448,99 @@ fn shows_open_positions() {
         );
     }
     println!("margin used: {}", user_state.margin_summary.total_margin_used);
+}
+
+/// A stop must exist on the exchange, not only inside Zorro. Zorro's own
+/// stops are virtual: it watches the price and sends a close when the level
+/// is hit, which protects nothing once Zorro is shut down. This opens a
+/// long with a stop far below the market, checks the exchange is holding
+/// it, then confirms closing the trade takes it away -- a stop outliving
+/// its position would act on whatever position came next.
+#[test]
+#[ignore]
+fn a_stop_rests_on_the_exchange_and_leaves_with_the_trade() {
+    login(None, BaseUrl::Testnet).expect("login should succeed");
+    let price = asset_price(TEST_PERP).expect("perp price");
+    let qty = minimum_qty(price);
+    let amount = (qty * AMOUNT_SCALE).round() as i32;
+    // Far enough below that it cannot trigger during the test.
+    let stop_dist = price * 0.10;
+
+    set_leverage(TEST_PERP, 1).expect("1x");
+    let (id, fill_px, fill) =
+        place_order(TEST_PERP, amount, 0.0, false, stop_dist).expect("long should fill");
+    assert!(fill != 0, "entry did not fill");
+
+    let stop_oid = state::get_trade(id).expect("trade").stop_oid;
+    println!("entry {fill_px}, stop oid {stop_oid:?}, trigger ~{}", fill_px - stop_dist);
+    let stop_oid = stop_oid.expect("no stop was recorded for the trade");
+
+    let plugin = state::get().unwrap();
+    let open = runtime::get()
+        .block_on(plugin.info_client.open_orders(plugin.address))
+        .expect("open_orders should succeed");
+    assert!(
+        open.iter().any(|o| o.oid == stop_oid),
+        "the exchange is not holding the stop: {open:?}"
+    );
+
+    let outcome = close_trade(id, fill, 0.0).expect("close should fill");
+    assert!(outcome.remaining <= 0.0, "{} left open", outcome.remaining);
+
+    let after = runtime::get()
+        .block_on(plugin.info_client.open_orders(plugin.address))
+        .expect("open_orders should succeed");
+    assert!(
+        !after.iter().any(|o| o.oid == stop_oid),
+        "the stop outlived its position: {after:?}"
+    );
+    assert!(
+        state::get_trade(id).expect("trade").stop_oid.is_none(),
+        "the trade still thinks it has a stop"
+    );
+}
+
+/// The spot close path as BrokerSell2 takes it, on the failures the Zorro
+/// run hit: a buy that delivers less than it filled because the fee is
+/// taken in the coin, a fee booked in the wrong currency, and a trade whose
+/// last sliver no order can sell. Buys 4 whole PURR (~$18) and closes the
+/// whole trade in one call; the sliver stays in the wallet as dust.
+#[test]
+#[ignore]
+fn a_spot_trade_closes_whole_and_retires_what_cannot_be_sold() {
+    login(None, BaseUrl::Testnet).expect("login should succeed");
+    let plugin = state::get().unwrap();
+    let (pair, _) = test_pair(plugin);
+    let price = asset_price(&pair).expect("price");
+    // Whole coins, so the net (minus the fee) still floors to 3 = over $10.
+    let coins = (15.0 / price).ceil();
+    let amount = (coins * AMOUNT_SCALE).round() as i32;
+
+    let (id, _, fill) = place_order(&pair, amount, 0.0, false, 0.0).expect("buy should fill");
+    let trade = state::get_trade(id).expect("trade");
+    println!("bought {coins} {pair}: Zorro told {fill} lots, entry fee {} USDC", trade.entry_fee);
+    assert!(fill < amount, "fill {fill} should be net of the fee taken in {pair}'s coin");
+    assert!(fill > amount * 99 / 100, "fill {fill} lost far more than a fee");
+    // 0.07% of ~$18 is ~$0.013; the same number read as coins would be ~0.003.
+    let fee_in_coins = (amount - fill) as f64 / AMOUNT_SCALE;
+    assert!(
+        trade.entry_fee > fee_in_coins * price * 0.9,
+        "entry fee {} was booked in coins, not USDC ({fee_in_coins} coins)",
+        trade.entry_fee
+    );
+
+    let outcome = close_trade(id, fill, 0.0).expect("whole-trade close should succeed");
+    println!(
+        "closed: told Zorro {} lots @ {}, fee {}, {} left",
+        outcome.fill, outcome.price, outcome.fee, outcome.remaining
+    );
+    assert_eq!(outcome.remaining, 0.0, "the trade must not keep an unsellable sliver open");
+    assert_eq!(outcome.fill.abs(), fill, "Zorro must be told the whole trade closed");
+    assert!(state::get_trade(id).expect("trade").closed, "trade not marked closed");
+
+    let (.., fill_state) = trade_status(id).expect("status");
+    assert_eq!(fill_state, -1, "BrokerTrade must report the trade gone");
+    let left = net_position(&pair).unwrap_or(0.0);
+    println!("{pair} left in the wallet: {left}");
+    assert!(left < 2.0, "{left} left: the close sold too little");
 }

@@ -38,6 +38,10 @@ pub struct TradeInfo {
     /// Fees of the closes booked against this trade so far. Kept apart from
     /// `entry_fee` so retrying the entry lookup cannot overwrite them.
     pub close_fees: f64,
+    /// Order id of this trade's stop on the exchange, while one rests there.
+    /// Held so closing the trade can cancel it: a stop left behind would
+    /// still be live against whatever position comes next.
+    pub stop_oid: Option<u64>,
 }
 
 impl TradeInfo {
@@ -164,10 +168,24 @@ pub fn register_trade(coin: &str, oid: u64, is_buy: bool, entry_price: f64, entr
                 entry_fee: 0.0,
                 entry_fee_final: false,
                 close_fees: 0.0,
+                stop_oid: None,
             },
         );
     }
     id
+}
+
+/// Records the exchange order id of the stop now resting for this trade.
+pub fn set_stop_oid(zorro_id: i32, oid: u64) {
+    with_trade(zorro_id, |info| info.stop_oid = Some(oid));
+}
+
+/// Hands back this trade's stop order id and forgets it, so a stop is only
+/// ever cancelled once.
+pub fn take_stop_oid(zorro_id: i32) -> Option<u64> {
+    let plugin = get()?;
+    let mut trades = plugin.trades.lock().unwrap_or_else(|e| e.into_inner());
+    trades.get_mut(&zorro_id)?.stop_oid.take()
 }
 
 /// Records what the entry fill cost, and stops the lookup being retried.

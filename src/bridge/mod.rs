@@ -9,7 +9,8 @@ use std::env;
 use alloy::signers::local::PrivateKeySigner;
 use hyperliquid_rust_sdk::{
     BaseUrl, CandlesSnapshotResponse, ClientCancelRequest, ClientLimit, ClientOrder,
-    ClientOrderRequest, ExchangeClient, ExchangeDataStatus, ExchangeResponseStatus, InfoClient,
+    ClientOrderRequest, ClientTrigger, ExchangeClient, ExchangeDataStatus,
+    ExchangeResponseStatus, InfoClient,
 };
 
 use crate::assets::{self, AssetInfo};
@@ -69,14 +70,17 @@ pub const ORDER_TYPE_GTC: i32 = 2;
 /// flattens instead of silently flipping into an opposing position. Spot has
 /// no position to reduce, so the flag is inert there.
 ///
-/// Returns `(zorro_trade_id, fill_price, fill_amount)` in `AMOUNT_SCALE` units.
+/// `stop_dist` is Zorro's stop-loss distance from the fill price, in price
+/// units. Above zero it rests a stop on the exchange once the entry fills,
+/// so the position stays protected even with Zorro shut down.
 ///
-/// TODO: a real `stop_dist` isn't wired to a Hyperliquid trigger order yet.
+/// Returns `(zorro_trade_id, fill_price, fill_amount)` in `AMOUNT_SCALE` units.
 pub fn place_order(
     symbol: &str,
     amount: i32,
     limit: f64,
     closing: bool,
+    stop_dist: f64,
 ) -> Result<(i32, f64, i32), String> {
     let plugin = state::get().ok_or("not logged in")?;
     if amount == 0 {
@@ -85,11 +89,40 @@ pub fn place_order(
     let is_buy = amount > 0;
     let raw_sz = amount.unsigned_abs() as f64 / AMOUNT_SCALE;
 
-    let (sz, limit_px, response) = runtime::get().block_on(async {
+    let (sz, limit_px, is_perp, response) = runtime::get().block_on(async {
         // Rounding rules depend on which universe the symbol lives in --
         // notably prices, where perps allow fewer decimals than spot.
         let asset = resolve_asset(&plugin.info_client, symbol).await?;
-        let sz = assets::round_size(raw_sz, asset.sz_decimals);
+        // Sizes that reduce a holding are floored, never rounded up. Spot has
+        // no reduce-only flag, so asking for more than the balance holds is
+        // rejected outright with "Insufficient spot balance" and the position
+        // is left open. That is routine, not an edge case: spot fees come out
+        // of the base asset, so buying 3 PURR leaves 2.9979 to sell, and
+        // 2.9979 rounds up to 3.
+        //
+        // Keyed on the order itself rather than on `closing`, because a spot
+        // sell reduces the balance whether or not the caller said so -- a
+        // safety rule that depends on the caller passing the right flag is
+        // not a safety rule. Perp closes are covered by `reduce_only`, but
+        // flooring them too costs nothing.
+        let reduces_a_holding = closing || (!asset.is_perp() && !is_buy);
+        let sz = if reduces_a_holding {
+            assets::floor_size(raw_sz, asset.sz_decimals)
+        } else {
+            assets::round_size(raw_sz, asset.sz_decimals)
+        };
+        // Rounding an order smaller than one size step leaves nothing to
+        // send, and the exchange answers only "Order has zero size", which
+        // says nothing about why. Name the step and what it costs instead:
+        // a market that has run up can price a whole budget below one step.
+        if sz <= 0.0 {
+            let step = 10f64.powi(-(asset.sz_decimals as i32));
+            return Err(format!(
+                "{raw_sz} {symbol} rounds to zero at {} decimals; one step is {step} (about {:.2} USDC at the current price)",
+                asset.sz_decimals,
+                step * mid_price(&plugin.info_client, symbol).await.unwrap_or(0.0)
+            ));
+        }
 
         // SDK's market_open() only checks the perp universe for price, 404s
         // on spot pairs -- build the order ourselves so one path serves both.
@@ -122,7 +155,7 @@ pub fn place_order(
             .order(order, None)
             .await
             .map_err(|e| format!("order request failed: {e}"))?;
-        Ok::<_, String>((sz, limit_px, response))
+        Ok::<_, String>((sz, limit_px, asset.is_perp(), response))
     })?;
 
     let exchange_response = match response {
@@ -137,10 +170,40 @@ pub fn place_order(
     match status {
         ExchangeDataStatus::Filled(order) => {
             let price: f64 = order.avg_px.parse().unwrap_or(limit_px);
-            let fill_sz: f64 = order.total_sz.parse().unwrap_or(sz);
+            let gross_sz: f64 = order.total_sz.parse().unwrap_or(sz);
+            // A spot buy pays its fee in the coin bought, so the account
+            // receives less than the order filled: 10 PURR bought is 9.993
+            // held. Zorro must track the 9.993, or the last 0.007 of every
+            // trade is a close that can never fill.
+            let spot_buy = is_buy && !is_perp;
+            let fees = if spot_buy { settled_fees(order.oid) } else { order_fees(order.oid) };
+            let fill_sz = gross_sz - fees.map_or(0.0, |f| f.in_base);
+            if spot_buy && fees.is_none() {
+                state::log_message(&format!(
+                    "{symbol} buy {}: fee not indexed yet, tracking the gross {gross_sz}",
+                    order.oid
+                ));
+            }
             let zorro_id = state::register_trade(symbol, order.oid, is_buy, price, fill_sz);
-            if let Some(fee) = order_fees(order.oid) {
-                state::set_entry_fee(zorro_id, fee);
+            if let Some(fees) = fees {
+                state::set_entry_fee(zorro_id, fees.usd);
+            }
+            // A stop only means something once there is a fill to protect.
+            if stop_dist > 0.0 {
+                match place_stop(symbol, is_buy, fill_sz, price, stop_dist) {
+                    Ok(stop_oid) => {
+                        state::set_stop_oid(zorro_id, stop_oid);
+                        state::log_message(&format!(
+                            "stop for trade {zorro_id}: {symbol} {stop_dist} away from {price}"
+                        ));
+                    }
+                    // The entry is already on the exchange, so refusing to
+                    // report it would lose the position. Say so loudly
+                    // instead: the trade is live and unprotected.
+                    Err(e) => {
+                        state::log_message(&format!("!! trade {zorro_id} has NO STOP: {e}"))
+                    }
+                }
             }
             Ok((zorro_id, price, (fill_sz * AMOUNT_SCALE).round() as i32))
         }
@@ -168,6 +231,14 @@ pub(crate) async fn resolve_asset(info: &InfoClient, symbol: &str) -> Result<Ass
 
 /// Slippage-adjusted price for an IOC "market" order, rounded to whatever
 /// the asset's universe allows.
+///
+/// Priced off the far side of the book rather than the mid. The mid is not a
+/// price anyone is offering, so on a wide book even a generous slippage
+/// margin lands inside the spread and the IOC is rejected outright with
+/// "could not immediately match against any resting orders" -- which is how
+/// a market buy failed on a pair quoting 3323 / 3390. Crossing the best
+/// offer and then adding slippage is what makes the order marketable; the
+/// slippage only has to cover the book moving between the read and the fill.
 async fn marketable_price(
     info: &InfoClient,
     symbol: &str,
@@ -175,30 +246,58 @@ async fn marketable_price(
     is_buy: bool,
     slippage: f64,
 ) -> Result<f64, String> {
+    let reference = match best_offer(info, symbol, is_buy).await {
+        Some(px) => px,
+        // An empty or unreadable book is not fatal: the mid still produces an
+        // order, and one that may rest is better than none at all.
+        None => {
+            state::log_message(&format!(
+                "marketable_price({symbol}): no book, falling back to the mid"
+            ));
+            mid_price(info, symbol).await?
+        }
+    };
+    let slipped = reference * if is_buy { 1.0 + slippage } else { 1.0 - slippage };
+    Ok(assets::round_price(slipped, asset))
+}
+
+/// Best price currently offered to the side we are about to take: the lowest
+/// ask when buying, the highest bid when selling. `None` if that side of the
+/// book is empty or unreadable.
+async fn best_offer(info: &InfoClient, symbol: &str, is_buy: bool) -> Option<f64> {
+    let book = info.l2_snapshot(symbol.to_string()).await.ok()?;
+    // levels[0] is bids, levels[1] is asks, each sorted best-first.
+    let side = book.levels.get(if is_buy { 1 } else { 0 })?;
+    side.first()?.px.parse().ok()
+}
+
+async fn mid_price(info: &InfoClient, symbol: &str) -> Result<f64, String> {
     let mids = info
         .all_mids()
         .await
         .map_err(|e| format!("all_mids failed: {e}"))?;
-    let mid: f64 = mids
-        .get(symbol)
+    mids.get(symbol)
         .ok_or_else(|| format!("no mid price for {symbol}"))?
         .parse()
-        .map_err(|_| format!("bad mid price for {symbol}"))?;
-
-    let slipped = mid * if is_buy { 1.0 + slippage } else { 1.0 - slippage };
-    Ok(assets::round_price(slipped, asset))
+        .map_err(|_| format!("bad mid price for {symbol}"))
 }
 
 /// Cancels a resting order by its Zorro trade id. Backs DO_CANCEL.
 pub fn cancel_order(zorro_id: i32) -> Result<(), String> {
-    let plugin = state::get().ok_or("not logged in")?;
     let info = state::get_trade(zorro_id).ok_or_else(|| format!("unknown trade id {zorro_id}"))?;
 
+    cancel_stop(&info.coin, zorro_id);
+    cancel_oid(&info.coin, info.oid)
+}
+
+/// Cancels one order by its exchange id.
+fn cancel_oid(symbol: &str, oid: u64) -> Result<(), String> {
+    let plugin = state::get().ok_or("not logged in")?;
     let response = runtime::get()
         .block_on(plugin.exchange_client.cancel(
             ClientCancelRequest {
-                asset: info.coin.clone(),
-                oid: info.oid,
+                asset: symbol.to_string(),
+                oid,
             },
             None,
         ))
@@ -213,6 +312,103 @@ pub fn cancel_order(zorro_id: i32) -> Result<(), String> {
             // which is what the caller wanted either way.
             _ => Ok(()),
         },
+    }
+}
+
+/// Rests a stop-loss on the exchange for a position just opened, and
+/// returns its order id.
+///
+/// The stop sells a long and buys back a short, so it goes on the opposite
+/// side of the entry at `entry +/- stop_dist`. It triggers as a market
+/// order: a stop that cannot fill is not a stop. On perps it is
+/// reduce-only, so it can only ever shrink the position it protects.
+///
+/// Why this matters: Zorro's own stops are virtual. It watches the price
+/// and sends a close when the level is hit, which protects nothing if Zorro
+/// is not running. This one lives on the exchange.
+fn place_stop(
+    symbol: &str,
+    entry_is_buy: bool,
+    sz: f64,
+    entry_price: f64,
+    stop_dist: f64,
+) -> Result<u64, String> {
+    let plugin = state::get().ok_or("not logged in")?;
+    let response = runtime::get().block_on(async {
+        let asset = resolve_asset(&plugin.info_client, symbol).await?;
+        let raw_trigger = if entry_is_buy {
+            entry_price - stop_dist
+        } else {
+            entry_price + stop_dist
+        };
+        if raw_trigger <= 0.0 {
+            return Err(format!(
+                "stop distance {stop_dist} puts the trigger at or below zero"
+            ));
+        }
+        let trigger_px = assets::round_price(raw_trigger, &asset);
+
+        // Triggering is what decides the fill, so the limit only has to be
+        // loose enough not to block it. Past the trigger by the same
+        // distance leaves room for the gap that set the stop off.
+        let limit_px = assets::round_price(
+            if entry_is_buy {
+                raw_trigger - stop_dist
+            } else {
+                raw_trigger + stop_dist
+            }
+            .max(0.0),
+            &asset,
+        );
+
+        let order = ClientOrderRequest {
+            asset: symbol.to_string(),
+            is_buy: !entry_is_buy,
+            reduce_only: asset.is_perp(),
+            limit_px,
+            sz: assets::round_size(sz, asset.sz_decimals),
+            cloid: None,
+            order_type: ClientOrder::Trigger(ClientTrigger {
+                is_market: true,
+                trigger_px,
+                tpsl: "sl".to_string(),
+            }),
+        };
+        plugin
+            .exchange_client
+            .order(order, None)
+            .await
+            .map_err(|e| format!("stop request failed: {e}"))
+    })?;
+
+    let data = match response {
+        ExchangeResponseStatus::Err(e) => return Err(format!("stop rejected: {e}")),
+        ExchangeResponseStatus::Ok(r) => r.data,
+    };
+    match data.and_then(|d| d.statuses.into_iter().next()) {
+        // A stop rests until it triggers, which is the expected outcome.
+        Some(ExchangeDataStatus::Resting(order)) => Ok(order.oid),
+        // Already past the level when it landed, so it fired immediately.
+        Some(ExchangeDataStatus::Filled(order)) => Ok(order.oid),
+        Some(ExchangeDataStatus::Error(e)) => Err(format!("stop error: {e}")),
+        other => Err(format!("unexpected stop status: {other:?}")),
+    }
+}
+
+/// Cancels a trade's stop, if it still has one resting.
+///
+/// A stop outliving its position is not harmless: reduce-only or not, it
+/// stays live on the exchange and would act on whatever position exists
+/// when it triggers.
+fn cancel_stop(symbol: &str, zorro_id: i32) {
+    let Some(oid) = state::take_stop_oid(zorro_id) else {
+        return;
+    };
+    match cancel_oid(symbol, oid) {
+        Ok(()) => state::log_message(&format!("stop for trade {zorro_id} cancelled")),
+        // Normal for a reduce-only stop: the exchange retires it with the
+        // position it protected, so there is nothing left to cancel.
+        Err(e) => state::log_message(&format!("stop for trade {zorro_id} already gone ({e})")),
     }
 }
 
@@ -243,7 +439,23 @@ pub fn close_trade(trade_id: i32, amount: i32, limit: f64) -> Result<CloseOutcom
         return Err("nothing to close".to_string());
     }
     let symbol = info.coin.clone();
-    let (close_id, price, fill) = place_order(&symbol, -amount, limit, true)?;
+    let requested = amount.unsigned_abs() as f64 / AMOUNT_SCALE;
+    let closes_whole_trade = requested >= info.remaining_sz - 1e-9;
+
+    let plan = spot_close_plan(&symbol, requested, closes_whole_trade, limit)?;
+    let (close_id, price, mut fill) = match &plan {
+        // A perp: reduce-only takes care of oversized closes.
+        None => place_order(&symbol, -amount, limit, true, 0.0)?,
+        Some(SpotClose::Sell(sz)) => {
+            place_order(&symbol, -((sz * AMOUNT_SCALE).round() as i32), limit, true, 0.0)?
+        }
+        Some(SpotClose::Unsellable { price, reason }) => {
+            if !closes_whole_trade {
+                return Err(format!("cannot close {requested} {symbol}: {reason}"));
+            }
+            return Ok(retire_as_dust(trade_id, &info, &symbol, *price, amount, reason));
+        }
+    };
 
     let closed_qty = fill.unsigned_abs() as f64 / AMOUNT_SCALE;
     let direction = if info.is_buy { 1.0 } else { -1.0 };
@@ -256,27 +468,190 @@ pub fn close_trade(trade_id: i32, amount: i32, limit: f64) -> Result<CloseOutcom
 
     // Measured against what is left of the trade, not against the amount
     // asked for: a chunk can fill in full while the trade still holds more.
-    let remaining = state::reduce_trade(trade_id, closed_qty);
+    let mut remaining = state::reduce_trade(trade_id, closed_qty);
+    // A whole-trade spot close can sell everything sellable and still leave
+    // a sliver the exchange will not take. Retire it with the trade, or
+    // Zorro retries a close that cannot fill for as long as it runs.
+    if closes_whole_trade && remaining > 0.0 && matches!(plan, Some(SpotClose::Sell(_))) {
+        state::log_message(&format!(
+            "trade {trade_id}: {remaining} {symbol} left after the close cannot be sold; \
+retired with the trade and left in the wallet"
+        ));
+        state::reduce_trade(trade_id, remaining);
+        remaining = 0.0;
+        fill = -amount.abs();
+    }
+    // Flat now, so its stop has nothing left to protect.
+    if remaining <= 0.0 {
+        cancel_stop(&symbol, trade_id);
+    }
 
     Ok(CloseOutcome { symbol, price, fill, profit, cost, fee, remaining })
+}
+
+/// How a spot close will be carried out.
+enum SpotClose {
+    /// Sell this size: capped at the balance, whole steps, over the minimum.
+    Sell(f64),
+    /// Nothing sellable. `price` values what is left for Zorro's P&L.
+    Unsellable { price: f64, reason: String },
+}
+
+/// For a spot close, what can actually be sold; `None` for a perp, whose
+/// close is reduce-only and needs none of this.
+///
+/// A spot close cannot sell what is not held, nor less than one size step,
+/// nor less than $10. Each of those is a hard rejection, and Zorro answers
+/// a rejected close by retrying it every few seconds for as long as it
+/// runs -- one live run logged dozens of them. Sizing the close to what the
+/// exchange will take, here, is what stops that.
+fn spot_close_plan(
+    symbol: &str,
+    requested: f64,
+    closes_whole_trade: bool,
+    limit: f64,
+) -> Result<Option<SpotClose>, String> {
+    let plugin = state::get().ok_or("not logged in")?;
+    runtime::get().block_on(async {
+        let asset = resolve_asset(&plugin.info_client, symbol).await?;
+        if asset.is_perp() {
+            return Ok(None);
+        }
+        let held = spot_balance(&plugin.info_client, plugin.address, symbol).await?;
+        // The minimum is checked against the price the order will carry,
+        // which for a market sell sits under the bid by the slippage margin.
+        let price = if limit > 0.0 {
+            assets::round_price(limit, &asset)
+        } else {
+            marketable_price(&plugin.info_client, symbol, &asset, false, 0.05).await?
+        };
+        let sz = assets::spot_close_size(requested, held, asset.sz_decimals, closes_whole_trade);
+        if assets::meets_minimum(sz, price) {
+            return Ok(Some(SpotClose::Sell(sz)));
+        }
+        let reason = if sz <= 0.0 {
+            format!("{held} held, under one size step")
+        } else {
+            format!(
+                "{sz} is all that can be sold and is worth {:.2}, under the {} USDC minimum",
+                sz * price,
+                assets::MIN_ORDER_USD
+            )
+        };
+        Ok(Some(SpotClose::Unsellable { price, reason }))
+    })
+}
+
+/// Marks the rest of a trade closed without an order, because no order for
+/// it can fill. The coins stay in the wallet; Zorro stops tracking them.
+fn retire_as_dust(
+    trade_id: i32,
+    info: &state::TradeInfo,
+    symbol: &str,
+    price: f64,
+    amount: i32,
+    reason: &str,
+) -> CloseOutcome {
+    let qty = info.remaining_sz;
+    state::log_message(&format!(
+        "trade {trade_id}: retiring the last {qty} {symbol} unsold ({reason}); left in the wallet"
+    ));
+    state::reduce_trade(trade_id, qty);
+    let direction = if info.is_buy { 1.0 } else { -1.0 };
+    let total_fees = state::get_trade(trade_id).map_or(info.total_fees(), |t| t.total_fees());
+    CloseOutcome {
+        symbol: symbol.to_string(),
+        price,
+        fill: -amount.abs(),
+        profit: direction * (price - info.entry_price) * qty,
+        cost: -total_fees,
+        fee: 0.0,
+        remaining: 0.0,
+    }
+}
+
+/// Free balance of `symbol`'s base coin -- the most a spot sell can take.
+async fn spot_balance(info: &InfoClient, address: alloy::primitives::Address, symbol: &str) -> Result<f64, String> {
+    let spot_meta = info.spot_meta().await.map_err(|e| format!("spot_meta failed: {e}"))?;
+    let pair = spot_meta
+        .universe
+        .iter()
+        .find(|a| a.name == symbol)
+        .ok_or_else(|| format!("{symbol} is not a spot pair"))?;
+    let base = spot_meta
+        .tokens
+        .iter()
+        .find(|t| t.index == pair.tokens[0])
+        .ok_or_else(|| format!("no base token for {symbol}"))?;
+    let balances = info
+        .user_token_balances(address)
+        .await
+        .map_err(|e| format!("balance read failed: {e}"))?;
+    Ok(balances.balances.iter().find(|b| b.coin == base.name).map_or(0.0, |b| {
+        let total: f64 = b.total.parse().unwrap_or(0.0);
+        let hold: f64 = b.hold.parse().unwrap_or(0.0);
+        (total - hold).max(0.0)
+    }))
+}
+
+/// What an order's fills cost in fees.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct OrderFees {
+    /// Every fee in USDC, whatever it was paid in. This is what Zorro books.
+    pub usd: f64,
+    /// The part paid in the coin bought, in that coin. The account received
+    /// this much less than the order filled.
+    pub in_base: f64,
 }
 
 /// Fees the exchange charged for order `oid`, summed over its fills.
 /// `None` when the order has no fills in the feed yet -- a fill can be
 /// acknowledged before it is indexed, so the caller retries rather than
 /// booking zero.
-pub fn order_fees(oid: u64) -> Option<f64> {
+pub fn order_fees(oid: u64) -> Option<OrderFees> {
     let plugin = state::get()?;
     let fills = runtime::get()
         .block_on(plugin.info_client.user_fills(plugin.address))
         .ok()?;
-    let mut fee = 0.0;
+    let mut total = OrderFees { usd: 0.0, in_base: 0.0 };
     let mut seen = false;
     for fill in fills.iter().filter(|f| f.oid == oid) {
-        fee += fill.fee.parse::<f64>().unwrap_or(0.0);
+        let fee = fill.fee.parse::<f64>().unwrap_or(0.0);
+        let px = fill.px.parse::<f64>().unwrap_or(0.0);
+        let (usd, in_base) = fee_split(fee, px, &fill.fee_token);
+        total.usd += usd;
+        total.in_base += in_base;
         seen = true;
     }
-    if seen { Some(fee) } else { None }
+    if seen { Some(total) } else { None }
+}
+
+/// `order_fees`, waiting briefly for the fills feed to catch up. Only for a
+/// spot buy, whose size depends on the fee and so cannot be fixed up later
+/// the way a fee alone can.
+fn settled_fees(oid: u64) -> Option<OrderFees> {
+    for attempt in 0..4 {
+        if attempt > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+        if let Some(fees) = order_fees(oid) {
+            return Some(fees);
+        }
+    }
+    None
+}
+
+/// `(fee in USDC, fee in the traded coin)` for one fill.
+///
+/// Perps and spot sells pay in USDC. A spot buy pays in the coin bought,
+/// and booking that number as USDC undercounted it by the coin's price:
+/// a fee of 0.01 PURR went into Zorro as $0.01 rather than $0.05.
+fn fee_split(fee: f64, px: f64, fee_token: &str) -> (f64, f64) {
+    if fee_token == "USDC" {
+        (fee, 0.0)
+    } else {
+        (fee * px, fee)
+    }
 }
 
 /// Funding this trade has paid, pro-rated by its share of the position.
@@ -315,6 +690,25 @@ fn prorate_funding(since_open: f64, position_sz: f64, trade_sz: f64) -> f64 {
     // Capped at the whole amount: a close can report more size than the
     // position still shows once the reduce has settled.
     since_open * (trade_sz / position_sz).min(1.0)
+}
+
+#[cfg(test)]
+mod fee_tests {
+    use super::fee_split;
+
+    #[test]
+    fn a_usdc_fee_is_booked_as_is() {
+        assert_eq!(fee_split(0.01, 5.0, "USDC"), (0.01, 0.0));
+    }
+
+    /// The undercount: 0.01 PURR at $5 is $0.05, not $0.01,
+    /// and it also comes off the size the buy delivered.
+    #[test]
+    fn a_fee_paid_in_the_coin_is_priced_and_taken_off_the_size() {
+        let (usd, in_base) = fee_split(0.01, 5.0, "PURR");
+        assert!((usd - 0.05).abs() < 1e-9, "got {usd}");
+        assert_eq!(in_base, 0.01);
+    }
 }
 
 #[cfg(test)]
@@ -399,8 +793,8 @@ pub fn trade_status(zorro_id: i32) -> Option<(f64, f64, f64, f64, i32)> {
 
     // Retry the fee lookup until the fills feed has caught up with the fill.
     if !info.entry_fee_final && filled_sz > 0.0 {
-        if let Some(fee) = order_fees(info.oid) {
-            state::set_entry_fee(zorro_id, fee);
+        if let Some(fees) = order_fees(info.oid) {
+            state::set_entry_fee(zorro_id, fees.usd);
         }
     }
     // pProfit is gross by contract ("without rollover and commission"), so
@@ -536,7 +930,10 @@ fn current_leverage(symbol: &str) -> Option<u32> {
 }
 
 /// Sets leverage for a perp. Backs Zorro's SET_LEVERAGE.
-pub fn set_leverage(symbol: &str, leverage: u32) -> Result<(), String> {
+///
+/// Returns whether anything changed on the exchange: spot accepts 1x as a
+/// no-op, which is not worth a log line before every order.
+pub fn set_leverage(symbol: &str, leverage: u32) -> Result<bool, String> {
     let plugin = state::get().ok_or("not logged in")?;
     if leverage == 0 {
         return Err("leverage must be at least 1".to_string());
@@ -568,11 +965,11 @@ pub fn set_leverage(symbol: &str, leverage: u32) -> Result<(), String> {
     })?;
 
     match response {
-        None => Ok(()), // spot: nothing to set
+        None => Ok(false), // spot: nothing to set
         Some(ExchangeResponseStatus::Err(e)) => Err(format!("leverage rejected: {e}")),
         Some(ExchangeResponseStatus::Ok(_)) => {
             state::cache_leverage(symbol, leverage);
-            Ok(())
+            Ok(true)
         }
     }
 }
@@ -587,25 +984,84 @@ pub fn asset_price(symbol: &str) -> Option<f64> {
 }
 
 /// Historical candles for `symbol`, newest first (BrokerHistory2 contract).
-pub fn history(symbol: &str, end_ole: f64, n_tick_minutes: i32, n_ticks: i32) -> Option<Vec<T6>> {
+///
+/// The window is clamped to the present. Zorro asks for a range that can end
+/// after the last closed bar, and may leave `end_ole` at 0 to mean "up to
+/// now"; both used to be converted straight through, so the span was measured
+/// back from a time that has not happened yet. Only the sliver overlapping
+/// real data held candles, which is how a 203-bar lookback returned one bar
+/// and left Zorro with an unfillable price series.
+pub fn history(
+    symbol: &str,
+    start_ole: f64,
+    end_ole: f64,
+    n_tick_minutes: i32,
+    n_ticks: i32,
+) -> Option<Vec<T6>> {
     let plugin = state::get()?;
     let interval = interval_for_minutes(n_tick_minutes);
-    let end_ms = ole_to_unix_millis(end_ole);
-    let span_ms = n_ticks as i64 * n_tick_minutes as i64 * 60_000;
-    let start_ms = (end_ms - span_ms).max(0);
+    let bar_ms = n_tick_minutes.max(1) as i64 * 60_000;
+    let span_ms = n_ticks.max(1) as i64 * bar_ms;
 
-    let mut candles = runtime::get()
-        .block_on(
-            plugin
-                .info_client
-                .candles_snapshot(symbol.to_string(), interval.to_string(), start_ms as u64, end_ms as u64),
-        )
-        .ok()?;
+    let (start_ms, end_ms) = history_window(start_ole, end_ole, span_ms, now_unix_millis());
 
+    let candles = runtime::get().block_on(plugin.info_client.candles_snapshot(
+        symbol.to_string(),
+        interval.to_string(),
+        start_ms as u64,
+        end_ms as u64,
+    ));
+    let mut candles = match candles {
+        Ok(candles) => candles,
+        Err(e) => {
+            state::log_message(&format!("history({symbol} {interval}): request failed: {e}"));
+            return None;
+        }
+    };
+
+    let received = candles.len();
     candles.sort_by_key(|c| std::cmp::Reverse(c.time_open)); // oldest-first -> newest-first
     candles.truncate(n_ticks.max(0) as usize);
+    // Logged because a short history is silent on Zorro's side until the
+    // lookback fails, and the window is the only thing that explains it.
+    state::log_message(&format!(
+        "history({symbol} {interval}): asked {n_ticks} bars in {start_ole:.5}..{end_ole:.5}, used {start_ms}..{end_ms}, got {received}, returning {}",
+        candles.len()
+    ));
     Some(candles.into_iter().map(candle_to_t6).collect())
 }
+
+/// The millisecond window to request, in `(start, end)`.
+///
+/// `end` never runs past `now`: a request for candles that do not exist yet
+/// comes back empty rather than erroring, so an unclamped end silently
+/// starves the series. `start` prefers Zorro's own range start and falls back
+/// to counting `span_ms` back from the end when Zorro leaves it unset, which
+/// it is free to do.
+fn history_window(start_ole: f64, end_ole: f64, span_ms: i64, now_ms: i64) -> (i64, i64) {
+    let requested_end = ole_to_unix_millis(end_ole);
+    let end_ms = if requested_end <= 0 {
+        now_ms
+    } else {
+        requested_end.min(now_ms)
+    };
+    let requested_start = ole_to_unix_millis(start_ole);
+    let span_start = end_ms - span_ms;
+    let start_ms = if requested_start <= 0 || requested_start > end_ms {
+        span_start
+    } else {
+        requested_start.min(span_start)
+    };
+    (start_ms.max(0), end_ms)
+}
+
+fn now_unix_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 
 fn candle_to_t6(c: CandlesSnapshotResponse) -> T6 {
     let parse = |s: &str| s.parse::<f32>().unwrap_or(0.0);
@@ -650,6 +1106,80 @@ fn ole_to_unix_millis(ole: f64) -> i64 {
 
 fn unix_millis_to_ole(unix_millis: i64) -> f64 {
     unix_millis as f64 / 86_400_000.0 + 25569.0
+}
+
+#[cfg(test)]
+mod history_window_tests {
+    use super::{history_window, unix_millis_to_ole};
+
+    const NOW: i64 = 1_793_527_380_000;
+    const SPAN: i64 = 203 * 60_000;
+
+    /// The live failure: Zorro asked for a range ending ahead of the last
+    /// closed bar, so every candle in the window was still in the future and
+    /// 203 bars of lookback came back as one.
+    #[test]
+    fn a_window_ending_in_the_future_is_pulled_back_to_now() {
+        let future = unix_millis_to_ole(NOW + SPAN);
+        let (start, end) = history_window(0.0, future, SPAN, NOW);
+        assert_eq!(end, NOW, "end should not outrun the present");
+        assert_eq!(start, NOW - SPAN, "a full span should still be asked for");
+    }
+
+    /// Zorro may leave the end unset to mean "up to now". Converting that 0
+    /// gives a large negative instant, which the request casts to an enormous
+    /// unsigned end time.
+    #[test]
+    fn an_unset_end_means_now() {
+        let (start, end) = history_window(0.0, 0.0, SPAN, NOW);
+        assert_eq!(end, NOW);
+        assert_eq!(start, NOW - SPAN);
+    }
+
+    #[test]
+    fn a_past_window_is_left_alone() {
+        let end_ms = NOW - 10 * 86_400_000;
+        let (start, end) = history_window(0.0, unix_millis_to_ole(end_ms), SPAN, NOW);
+        assert_eq!(end, end_ms);
+        assert_eq!(start, end_ms - SPAN);
+    }
+
+    /// A start Zorro supplies that reaches further back than the span is
+    /// honoured, so a chunked fetch is not cut short of what it asked for.
+    #[test]
+    fn a_wider_start_from_zorro_wins() {
+        let end_ms = NOW - 60_000;
+        let start_ms = end_ms - 10 * SPAN;
+        let (start, end) = history_window(
+            unix_millis_to_ole(start_ms),
+            unix_millis_to_ole(end_ms),
+            SPAN,
+            NOW,
+        );
+        assert_eq!(end, end_ms);
+        assert_eq!(start, start_ms);
+    }
+
+    /// Nonsense from Zorro must not produce a window the exchange rejects.
+    #[test]
+    fn a_start_after_the_end_falls_back_to_the_span() {
+        let end_ms = NOW - 60_000;
+        let (start, end) = history_window(
+            unix_millis_to_ole(NOW + 86_400_000),
+            unix_millis_to_ole(end_ms),
+            SPAN,
+            NOW,
+        );
+        assert_eq!(end, end_ms);
+        assert_eq!(start, end_ms - SPAN);
+        assert!(start < end);
+    }
+
+    #[test]
+    fn the_window_never_goes_negative() {
+        let (start, _) = history_window(0.0, unix_millis_to_ole(1_000), SPAN, NOW);
+        assert_eq!(start, 0);
+    }
 }
 
 #[cfg(test)]

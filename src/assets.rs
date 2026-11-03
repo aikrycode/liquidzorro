@@ -86,6 +86,45 @@ pub fn round_size(value: f64, sz_decimals: u32) -> f64 {
     round_to_decimals(value, sz_decimals)
 }
 
+/// Rounds a size *down* to the asset's step. For closing orders only, where
+/// rounding up would ask to sell more than is held.
+pub fn floor_size(value: f64, sz_decimals: u32) -> f64 {
+    let factor = 10f64.powi(sz_decimals as i32);
+    // Nudge first, so a value that is one float epsilon under a step
+    // boundary is not thrown a whole step away.
+    ((value * factor) + 1e-9).floor() / factor
+}
+
+/// Smallest order value Hyperliquid accepts, in USDC. Spot has no
+/// reduce-only exemption, so a spot close under this is refused like any
+/// other order.
+pub const MIN_ORDER_USD: f64 = 10.0;
+
+/// How much of a spot close can actually be sold: what Zorro asked for,
+/// capped at the balance and floored to a whole step.
+///
+/// Closing a whole trade may round *up* by part of a step when the balance
+/// holds it. The step floor otherwise strands a sliver on every trade,
+/// slivers from successive trades pile up, and none of them can ever be
+/// sold on its own. Letting a closing trade take up to one step from the
+/// balance keeps the leftover under one step instead of growing.
+pub fn spot_close_size(requested: f64, held: f64, sz_decimals: u32, closes_whole_trade: bool) -> f64 {
+    let target = if closes_whole_trade { ceil_size(requested, sz_decimals) } else { requested };
+    floor_size(target.min(held).max(0.0), sz_decimals)
+}
+
+/// Whether an order of `sz` at `price` clears the exchange minimum.
+pub fn meets_minimum(sz: f64, price: f64) -> bool {
+    sz > 0.0 && sz * price >= MIN_ORDER_USD
+}
+
+/// Rounds a size *up* to the asset's step, ignoring float dust just above
+/// a step boundary.
+fn ceil_size(value: f64, sz_decimals: u32) -> f64 {
+    let factor = 10f64.powi(sz_decimals as i32);
+    ((value * factor) - 1e-9).ceil() / factor
+}
+
 /// Rounds a price to 5 significant figures and the asset's decimal cap,
 /// which is what Hyperliquid enforces.
 pub fn round_price(value: f64, asset: &AssetInfo) -> f64 {
@@ -110,6 +149,32 @@ fn round_to_significant_and_decimal(value: f64, sig_figs: u32, max_decimals: u32
 
 #[cfg(test)]
 mod tests {
+
+    /// The live failure: a 3-coin spot buy pays its fee in the base asset,
+    /// leaving 2.9979. Rounding that to 3 asked to sell more than the
+    /// balance held, so the exchange refused and the position stayed open.
+    #[test]
+    fn a_close_never_rounds_up_past_what_is_held() {
+        assert_eq!(super::floor_size(2.9979, 0), 2.0);
+        assert_eq!(super::floor_size(0.9979, 0), 0.0);
+        assert_eq!(super::round_size(2.9979, 0), 3.0, "rounding is what broke it");
+    }
+
+    #[test]
+    fn flooring_keeps_whole_steps_intact() {
+        assert_eq!(super::floor_size(3.0, 0), 3.0);
+        assert_eq!(super::floor_size(0.28, 2), 0.28);
+        assert_eq!(super::floor_size(0.2849, 2), 0.28);
+    }
+
+    /// A size landing an epsilon under a step boundary must not lose a whole
+    /// step -- on a whole-coin asset that would be the entire order.
+    #[test]
+    fn flooring_tolerates_float_dust_below_a_step() {
+        assert_eq!(super::floor_size(3.0 - 1e-12, 0), 3.0);
+        assert_eq!(super::floor_size(0.28 - 1e-12, 2), 0.28);
+    }
+
     use super::*;
 
     fn perp(sz: u32) -> AssetInfo {
@@ -166,5 +231,39 @@ mod tests {
     fn rounding_handles_zero_and_negatives() {
         assert_eq!(round_price(0.0, &perp(2)), 0.0);
         assert_eq!(round_price(-92.42224, &spot(2)), -92.422);
+    }
+
+    /// The second live failure: chunks that floored under $10 were
+    /// refused, and a trade's last sliver could never be sold at all.
+    #[test]
+    fn a_partial_close_sells_whole_steps_it_holds() {
+        assert_eq!(spot_close_size(2.9979, 9.993, 0, false), 2.0);
+        assert_eq!(spot_close_size(4.0, 9.993, 0, false), 4.0);
+    }
+
+    #[test]
+    fn a_close_never_sells_more_than_the_balance() {
+        assert_eq!(spot_close_size(10.0, 9.993, 0, false), 9.0);
+        assert_eq!(spot_close_size(10.0, 9.993, 0, true), 9.0);
+        assert_eq!(spot_close_size(1.0, 0.0, 0, true), 0.0);
+    }
+
+    /// 2.993 left in the trade and 3.9 in the wallet (old dust included):
+    /// selling 3 retires the trade; selling 2 would strand 0.993 forever.
+    #[test]
+    fn closing_a_whole_trade_may_take_one_step_from_the_balance() {
+        assert_eq!(spot_close_size(2.993, 3.9, 0, true), 3.0);
+        assert_eq!(spot_close_size(2.993, 3.9, 0, false), 2.0);
+        // never more than one step beyond the trade
+        assert_eq!(spot_close_size(2.0, 50.0, 0, true), 2.0);
+        assert_eq!(spot_close_size(2.0000000001, 50.0, 0, true), 2.0);
+    }
+
+    #[test]
+    fn the_ten_dollar_minimum_is_inclusive() {
+        assert!(meets_minimum(3.0, 4.53));
+        assert!(!meets_minimum(2.0, 4.53));
+        assert!(meets_minimum(1.0, 10.0));
+        assert!(!meets_minimum(0.0, 1e9));
     }
 }

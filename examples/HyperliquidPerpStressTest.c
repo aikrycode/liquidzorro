@@ -29,6 +29,10 @@
 // Dust has to be a cash amount, not a lot count: 1000 lots is $1.58 of HYPE
 // but $23 of ETH, which would swallow an entire test position.
 #define DUST_USD        1.0
+// Stop distance as a share of price. Wide enough that the test cannot
+// trigger it, so what is measured is that the exchange accepted and then
+// released it -- not whether it fires.
+#define STOP_PCT        0.10
 
 // BrokerCommand codes (trading.h)
 #define CMD_SET_SYMBOL     132
@@ -49,13 +53,17 @@
 #define PH_CHECK_SHORT  7
 #define PH_CLOSE_SHORT  8
 #define PH_CHECK_FLAT2  9
-#define PH_LIMIT_PLACE  10
-#define PH_LIMIT_POLL   11
-#define PH_LIMIT_CANCEL 12
-#define PH_REJECT       13
-#define PH_FLATTEN      14
-#define PH_REPORT       15
-#define PH_DONE         16
+#define PH_STOP_OPEN    10
+#define PH_STOP_CHECK   11
+#define PH_STOP_CLOSE   12
+#define PH_LIMIT_PLACE  13
+#define PH_LIMIT_POLL   14
+#define PH_LIMIT_CANCEL 15
+#define PH_REJECT       16
+#define PH_FLATTEN      17
+#define PH_REPORT       18
+#define PH_STOP_FLAT    20
+#define PH_DONE         19
 
 int Phase;
 int Passed, Failed;
@@ -76,6 +84,16 @@ void check(string Name, int Ok)
 		Failed++;
 		printf("\n  FAIL  %s", Name);
 	}
+}
+
+// Costs Zorro has booked across every trade so far. The plugin reports
+// fees and funding through BrokerTrade's pRoll, which lands here, and
+// money paid is negative.
+var bookedCost()
+{
+	var Sum = 0;
+	for(all_trades) Sum += TradeRoll;
+	return Sum;
 }
 
 // Signed: negative while short. Reads the exchange, not Zorro's book.
@@ -240,8 +258,13 @@ function run()
 
 	if(Phase == PH_CHECK_FLAT1) {
 		var Held = heldLots();
+		var Cost = bookedCost();
 		printf("\nPosition after exitLong: %.0f lots", Held);
 		check("exitLong closes the long", isFlat(Held));
+		// The round trip paid exchange fees. If this reads zero, Zorro's
+		// P&L is gross and the plugin is not reporting what it cost.
+		printf("\nCost booked by Zorro: %.4f", Cost);
+		check("Fees reach Zorro as a trade cost", Cost < 0);
 		Phase = PH_OPEN_SHORT;
 		return;
 	}
@@ -281,6 +304,56 @@ function run()
 		var Held = heldLots();
 		printf("\nPosition after exitShort: %.0f lots", Held);
 		check("exitShort closes the short", isFlat(Held));
+		Phase = PH_STOP_OPEN;
+		return;
+	}
+
+	///////////////////////////////////////////////////////////////////////
+	// Stop loss held by the exchange. StopFactor = 1 hands the stop to the
+	// broker instead of Zorro watching the price itself, which is what
+	// keeps a position protected while Zorro is not running.
+	///////////////////////////////////////////////////////////////////////
+	if(Phase == PH_STOP_OPEN) {
+		var Price = priceClose(0);
+		if(Price <= 0) return;
+		brokerCommand(CMD_SET_ORDERTYPE, ORDERTYPE_IOC);
+		OrderLimit = 0;
+		StopFactor = 1;                   // the exchange owns this stop
+		Stop = STOP_PCT*Price;            // distance, not a level
+		Lots = lotsFor(TRADE_USD);
+		if(Lots <= 0) return;
+		enterLong();
+		printf("\nLong with a stop %.2f below %.2f", Stop, Price);
+		Phase = PH_STOP_CHECK;
+		return;
+	}
+
+	if(Phase == PH_STOP_CHECK) {
+		var Held = heldLots();
+		printf("\nPosition with a stop attached: %.0f lots", Held);
+		check("A stopped entry still opens the position", Held > dustLots());
+		// A stop this far away must not cost the position. Firing here
+		// would mean the trigger went in on the wrong side.
+		check("A stop far from the market does not fire", !isFlat(Held));
+		Phase = PH_STOP_CLOSE;
+		return;
+	}
+
+	if(Phase == PH_STOP_CLOSE) {
+		exitLong();
+		Stop = 0;
+		StopFactor = 0;                   // back to Zorro-side stops
+		printf("\nexitLong submitted; the stop should go with it");
+		Phase = PH_STOP_FLAT;
+		return;
+	}
+
+	if(Phase == PH_STOP_FLAT) {
+		var Held = heldLots();
+		printf("\nPosition after closing the stopped trade: %.0f lots", Held);
+		check("Closing a stopped trade still flattens it", isFlat(Held));
+		// A stop left resting would act on whatever position came next,
+		// so the sweep at the end checks nothing is left behind.
 		Phase = PH_LIMIT_PLACE;
 		return;
 	}
@@ -338,7 +411,11 @@ function run()
 	if(Phase == PH_LIMIT_CANCEL) {
 		var Result = brokerCommand(CMD_DO_CANCEL, LimitTradeID);
 		check("DO_CANCEL cancels the resting perpetual order", Result == 1);
-		if(Result == 1) LimitCancelled = 1;
+		// DO_CANCEL removes the order on the exchange but not from Zorro's
+		// own list, where it lingered as a zero-lot "open" trade on the
+		// status page for the rest of the run. cancelTrade drops it from
+		// the list without sending anything to the broker.
+		if(Result == 1) { LimitCancelled = 1; cancelTrade(LimitTradeID); }
 		Phase = PH_REJECT;
 		return;
 	}
@@ -413,6 +490,11 @@ function run()
 		check("Undersized order left the position unchanged",
 			abs(Held - PositionBeforeReject) <= dustLots());
 		check("Account ends flat", isFlat(Held));
+		// The exchange being flat is not enough: a trade Zorro still thinks
+		// is open retries its close for as long as it runs.
+		Resting = 0;
+		for(open_trades) if(TradeLots > 0) Resting++;
+		check("Zorro holds no open trades at the end", Resting == 0);
 		check("Balance stayed above the floor", EndBalance >= MIN_BALANCE);
 
 		printf("\n=== RESULT: %d passed, %d failed ===", Passed, Failed);
@@ -428,8 +510,8 @@ function run()
 
 	// Safe to quit here: quit() force-closes open trades, and PH_FLATTEN
 	// has already cancelled every resting order and closed every position,
-	// with PH_REPORT confirming the exchange is flat. The only entry left
-	// in Zorro's book is the cancelled limit order, holding zero lots.
+	// with PH_REPORT confirming the exchange is flat and Zorro's own list
+	// holding no open trades.
 	if(Phase == PH_DONE) {
 		printf("\nPerpetual stress test complete -- stopping.");
 		quit("Perpetual stress test complete");

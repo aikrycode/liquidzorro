@@ -204,7 +204,7 @@ pub unsafe extern "C" fn BrokerAsset(
 #[no_mangle]
 pub unsafe extern "C" fn BrokerHistory2(
     asset: *mut c_char,
-    _t_start: Date,
+    t_start: Date,
     t_end: Date,
     n_tick_minutes: c_int,
     n_ticks: c_int,
@@ -218,7 +218,7 @@ pub unsafe extern "C" fn BrokerHistory2(
         if ticks.is_null() || n_ticks <= 0 {
             return 0;
         }
-        let Some(candles) = bridge::history(symbol, t_end, n_tick_minutes, n_ticks) else {
+        let Some(candles) = bridge::history(symbol, t_start, t_end, n_tick_minutes, n_ticks) else {
             state::log_message(&format!("BrokerHistory2({symbol}): history unavailable"));
             return 0;
         };
@@ -282,15 +282,17 @@ pub unsafe extern "C" fn BrokerBuy2(
         };
         // Zorro signals "this call closes a position" with StopDist == -1;
         // the sign of Amount alone can't distinguish closing a long from
-        // opening a short. Any other value is a stop distance, still TODO.
+        // opening a short. Above zero it is the stop's distance from the
+        // fill price, and zero means no stop.
         let closing = stop_dist == -1.0;
+        let stop = if closing { 0.0 } else { stop_dist.max(0.0) };
         let side = match (amount > 0, closing) {
             (true, false) => "buy",
             (false, false) => "sell",
             (true, true) => "close short",
             (false, true) => "close long",
         };
-        match bridge::place_order(symbol, amount, limit, closing) {
+        match bridge::place_order(symbol, amount, limit, closing, stop) {
             Ok((zorro_id, price, fill)) => {
                 if !p_price.is_null() {
                     *p_price = price;
@@ -442,10 +444,12 @@ pub unsafe extern "C" fn BrokerCommand(command: c_int, parameter: isize) -> f64 
             };
             let leverage = parameter as i32;
             match bridge::set_leverage(&symbol, leverage.max(0) as u32) {
-                Ok(()) => {
-                    state::log_message(&format!(
-                        "BrokerCommand(SET_LEVERAGE): {symbol} set to {leverage}x cross"
-                    ));
+                Ok(applied) => {
+                    if applied {
+                        state::log_message(&format!(
+                            "BrokerCommand(SET_LEVERAGE): {symbol} set to {leverage}x cross"
+                        ));
+                    }
                     leverage as f64
                 }
                 Err(e) => {

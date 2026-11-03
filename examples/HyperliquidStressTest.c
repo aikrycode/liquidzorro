@@ -9,25 +9,40 @@
 // Broker: Hyperliquid. User: blank. Password: your private key.
 // Demo = testnet. [Trade] mode only.
 //
-// Budget: holds at most ~$57 of testnet USDC at once and loses only
+// Budget: holds at most ~$75 of testnet USDC at once and loses only
 // spread/slippage (a few dollars across a full run). Aborts immediately if
 // the account balance would drop under MIN_BALANCE.
+//
+// Traded on PURR/USDC, the canonical testnet spot pair. HYPE/USDC ("@1035")
+// is unusable for this: it quotes a ~22% spread and ran from $188 to $5480
+// inside two hours, which put one 0.01-coin size step at $54.80 -- above the
+// whole per-cycle budget -- and left the cost and balance assertions unable
+// to tell a bug from the spread.
 
-#define HL_SYMBOL       "HYPE/USDC"  // testnet symbol "@1035"
+#define HL_SYMBOL       "PURR/USDC"  // canonical pair; exchange symbol is the same
 #define ALT_SYMBOL      "BTC/USD"    // priced only -- too coarse to trade at this size
 #define MIN_BALANCE     750          // hard floor; abort rather than spend past this
-#define TRADE_USD       45           // per cycle; split in 3, each chunk must clear $10
-#define LIMIT_USD       12           // resting limit order notional
+// Per cycle, split in three. PURR trades in whole coins and a sell must
+// clear $10 at its slippage-adjusted price, so every chunk needs at least
+// 3 whole coins; at ~$4.50 that takes 13 coins, and the smallest chunk at
+// $45 floored to 2 coins ($9) and was refused dozens of times in one run.
+#define TRADE_USD       60
+// Resting limit notional. PURR trades in whole coins, so the lot count
+// rounds down by up to one coin; 15 keeps the order clear of the exchange's
+// $10 minimum even after that haircut.
+#define LIMIT_USD       15
 #define CYCLES          2            // market round trips
 #define HISTORY_BARS    50           // candles to pull via BrokerHistory2
 
 #define AMOUNT_SCALE    100000.
-// One exchange size step for HL_SYMBOL: HYPE trades in 0.01-coin
-// increments, which is 1000 lots. Less than this cannot be sold at
-// all, so it is the floor a close can reach, not a tolerance.
-#define DUST_THRESHOLD_LOTS 1000.
+// One exchange size step for HL_SYMBOL: PURR has szDecimals 0, so it
+// trades in whole coins, which is 100000 lots. Less than this cannot be
+// sold at all, so it is the floor a close can reach, not a tolerance.
+#define DUST_THRESHOLD_LOTS 100000.
 // A sweep that stops making progress would otherwise retry forever.
 #define MAX_SWEEPS      3
+// One whole coin, the unit chunks are cut in.
+#define STEP_LOTS       100000.
 
 // BrokerCommand codes (trading.h)
 #define CMD_GET_POSITION   53
@@ -62,6 +77,8 @@ int LimitTradeID;
 int LimitPollsLeft;
 int LimitCancelled;
 int SweepsLeft;
+var BeforeSell;      // position before the last partial close, 0 once checked
+int SellMisses;      // partial closes this cycle that sold nothing
 
 void check(string Name, int Ok)
 {
@@ -72,6 +89,15 @@ void check(string Name, int Ok)
 		Failed++;
 		printf("\n  FAIL  %s", Name);
 	}
+}
+
+// Costs Zorro has booked across every trade. The plugin reports fees
+// through BrokerTrade's pRoll, which lands here; money paid is negative.
+var bookedCost()
+{
+	var Sum = 0;
+	for(all_trades) Sum += TradeRoll;
+	return Sum;
 }
 
 // Real exchange position in lots, independent of Zorro's local trade list.
@@ -85,7 +111,33 @@ var heldLots()
 // several pieces.
 void sellPart(var SellLots)
 {
+	BeforeSell = heldLots();
 	exitLong(0, 0, SellLots);
+}
+
+// Counts the last partial close as a miss if the exchange position did
+// not drop. A refused close is otherwise invisible here: Zorro retries it
+// quietly, and a later sweep can still flatten the account, so the run
+// used to pass with dozens of rejections in its log.
+void noteSale()
+{
+	if(BeforeSell <= 0) return;
+	if(heldLots() >= BeforeSell) {
+		SellMisses++;
+		printf("
+        (that close sold nothing)");
+	}
+	BeforeSell = 0;
+}
+
+// Trades Zorro still holds lots in. The exchange being flat is not enough:
+// a trade Zorro thinks is open keeps retrying its close for as long as it
+// runs, and quit() tries once more on the way out.
+int openTrades()
+{
+	int N = 0;
+	for(open_trades) if(TradeLots > 0) N++;
+	return N;
 }
 
 // Guards the budget. Returns 1 if there is room to keep trading.
@@ -145,7 +197,7 @@ function run()
 
 		// --- asset pricing, two different symbols ---
 		Price = priceClose(0);
-		check("BrokerAsset prices HYPE/USDC", Price > 0);
+		check("BrokerAsset prices PURR/USDC", Price > 0);
 
 		asset(ALT_SYMBOL);
 		AltPrice = priceClose(0);
@@ -180,6 +232,8 @@ function run()
 		brokerCommand(CMD_SET_ORDERTYPE, ORDERTYPE_IOC);
 		OrderLimit = 0;                        // market order
 		PositionBeforeBuy = heldLots();        // so the fill check measures this buy
+		SellMisses = 0;
+		BeforeSell = 0;
 		Lots = ceil(TRADE_USD/Price*AMOUNT_SCALE);
 		enterLong();
 		printf("\n[cycle %d] buy submitted: %.0f lots (~$%d)", Cycle+1, Lots, TRADE_USD);
@@ -196,9 +250,12 @@ function run()
 			Phase = PH_CYCLE_END;
 			return;
 		}
-		// uneven split, each chunk still comfortably over the $10 minimum
-		Chunk1 = floor(Held*0.4);
-		Chunk2 = floor(Held*0.3);
+		// Uneven split in whole coins: a fractional chunk is floored by the
+		// plugin, and 2.998 coins floored to 2 is under the $10 minimum.
+		// The last chunk takes the remainder, fractions and all, so it
+		// closes the whole trade and the plugin retires the sliver with it.
+		Chunk1 = floor(Held*0.4/STEP_LOTS)*STEP_LOTS;
+		Chunk2 = floor(Held*0.3/STEP_LOTS)*STEP_LOTS;
 		Chunk3 = Held - Chunk1 - Chunk2;
 		printf("\n[cycle %d] filled %.0f lots; selling %.0f / %.0f / %.0f",
 			Cycle+1, Held, Chunk1, Chunk2, Chunk3);
@@ -207,11 +264,13 @@ function run()
 	}
 
 	if(Phase == PH_SELL_A) { sellPart(Chunk1); Phase = PH_SELL_B; return; }
-	if(Phase == PH_SELL_B) { sellPart(Chunk2); Phase = PH_SELL_C; return; }
-	if(Phase == PH_SELL_C) { sellPart(Chunk3); SweepsLeft = MAX_SWEEPS; Phase = PH_SWEEP; return; }
+	if(Phase == PH_SELL_B) { noteSale(); sellPart(Chunk2); Phase = PH_SELL_C; return; }
+	if(Phase == PH_SELL_C) { noteSale(); sellPart(Chunk3); SweepsLeft = MAX_SWEEPS; Phase = PH_SWEEP; return; }
 
 	if(Phase == PH_SWEEP) {
-		var Leftover = heldLots();
+		var Leftover;
+		noteSale();
+		Leftover = heldLots();
 		if(Leftover > DUST_THRESHOLD_LOTS && SweepsLeft > 0) {
 			SweepsLeft--;
 			printf("\n[cycle %d] sweeping leftover: %.0f lots (%d tries left)",
@@ -224,6 +283,9 @@ function run()
 			printf("\n        (gave up after %d sweeps)", MAX_SWEEPS);
 		else if(Leftover > 0)
 			printf("\n        (%.0f lots left, under one size step)", Leftover);
+		check("Every partial close sold on the exchange", SellMisses == 0);
+		if(SellMisses > 0) printf("\n        (%d closes sold nothing)", SellMisses);
+		check("Zorro's trade is closed, not just the exchange position", openTrades() == 0);
 		Phase = PH_CYCLE_END;
 		return;
 	}
@@ -292,7 +354,11 @@ function run()
 	if(Phase == PH_LIMIT_CANCEL) {
 		var Result = brokerCommand(CMD_DO_CANCEL, LimitTradeID);
 		check("DO_CANCEL cancels the resting order", Result == 1);
-		if(Result == 1) LimitCancelled = 1;
+		// DO_CANCEL removes the order on the exchange but not from Zorro's
+		// own list, where it lingered as a zero-lot "open" trade on the
+		// status page for the rest of the run. cancelTrade drops it from
+		// the list without sending anything to the broker.
+		if(Result == 1) { LimitCancelled = 1; cancelTrade(LimitTradeID); }
 		Phase = PH_REJECT;
 		return;
 	}
@@ -338,7 +404,12 @@ function run()
 		check("Undersized order left the position unchanged",
 			abs(Held - PositionBeforeReject) <= DUST_THRESHOLD_LOTS);
 		check("Plugin still responds after a rejection", Held >= 0);
+		check("Zorro holds no open trades at the end", openTrades() == 0);
 		check("Balance stayed above the floor", EndBalance >= MIN_BALANCE);
+		// Spot pays a taker fee on every fill. Zero here would mean
+		// Zorro's P&L is gross and the cost never reached it.
+		printf("\nCost booked by Zorro: %.4f", bookedCost());
+		check("Fees reach Zorro as a trade cost", bookedCost() < 0);
 
 		printf("\n=== RESULT: %d passed, %d failed ===", Passed, Failed);
 		printf("\nBalance %.2f -> %.2f (cost %.2f USDC)",
@@ -354,8 +425,8 @@ function run()
 
 	// quit() force-closes whatever Zorro still has open, unlike [Stop] with
 	// AutoConfirm = 1. By here PH_SWEEP has flattened the exchange position
-	// and PH_REPORT has cancelled any resting order, so the only entry left
-	// is the cancelled limit order, holding zero lots and nothing to close.
+	// and PH_REPORT has cancelled any resting order, so Zorro's list is
+	// empty and there is nothing left to close.
 	if(Phase == PH_DONE) {
 		printf("\nStress test complete -- stopping.");
 		quit("Spot stress test complete");
