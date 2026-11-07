@@ -974,6 +974,77 @@ pub fn set_leverage(symbol: &str, leverage: u32) -> Result<bool, String> {
     }
 }
 
+/// Daily funding per lot as Zorro's `(RollLong, RollShort)` for a perp;
+/// `(0, 0)` for spot or when the rate cannot be read.
+///
+/// Zorro books a positive roll as money received. Hyperliquid's rate is
+/// hourly and a positive one means longs pay shorts, so a long's roll is
+/// the negated daily rate times the notional of one lot.
+pub fn rollover_per_lot(symbol: &str) -> (f64, f64) {
+    match perp_funding(symbol) {
+        Some((rate, oracle)) => roll_per_lot(rate, oracle),
+        None => (0.0, 0.0),
+    }
+}
+
+/// The sign and scale rule of `rollover_per_lot`, apart from the network.
+fn roll_per_lot(hourly_rate: f64, oracle_px: f64) -> (f64, f64) {
+    let daily = hourly_rate * 24.0 * oracle_px / AMOUNT_SCALE;
+    (-daily, daily)
+}
+
+/// `(hourly funding rate, oracle price)` for a perp, from a snapshot of the
+/// whole perp universe refreshed at most once a minute. `None` for spot,
+/// which has no funding and is absent from the perp universe.
+fn perp_funding(symbol: &str) -> Option<(f64, f64)> {
+    if let Some(cached) = state::cached_funding(symbol) {
+        return cached;
+    }
+    let plugin = state::get()?;
+    let (meta, contexts) = runtime::get()
+        .block_on(plugin.info_client.meta_and_asset_contexts())
+        .ok()?;
+    let rates = meta
+        .universe
+        .iter()
+        .zip(contexts.iter())
+        .filter_map(|(asset, ctx)| {
+            let rate = ctx.funding.parse::<f64>().ok()?;
+            let oracle = ctx.oracle_px.parse::<f64>().ok()?;
+            Some((asset.name.clone(), (rate, oracle)))
+        })
+        .collect::<std::collections::HashMap<_, _>>();
+    let found = rates.get(symbol).copied();
+    state::cache_funding(rates);
+    found
+}
+
+#[cfg(test)]
+mod roll_tests {
+    use super::{roll_per_lot, AMOUNT_SCALE};
+
+    /// ETH at $2,000 with 0.00125% an hour: a coin costs a long $0.60 a
+    /// day, and a lot is 1/AMOUNT_SCALE of a coin.
+    #[test]
+    fn a_positive_rate_charges_longs_and_pays_shorts() {
+        let (long, short) = roll_per_lot(0.0000125, 2000.0);
+        let per_coin = 0.6;
+        assert!((long + per_coin / AMOUNT_SCALE).abs() < 1e-15, "got {long}");
+        assert!((short - per_coin / AMOUNT_SCALE).abs() < 1e-15, "got {short}");
+    }
+
+    #[test]
+    fn a_negative_rate_pays_longs() {
+        let (long, short) = roll_per_lot(-0.00001, 3000.0);
+        assert!(long > 0.0 && short < 0.0);
+    }
+
+    #[test]
+    fn no_rate_no_roll() {
+        assert_eq!(roll_per_lot(0.0, 2000.0), (-0.0, 0.0));
+    }
+}
+
 /// Last ask price for `symbol` via `all_mids`.
 pub fn asset_price(symbol: &str) -> Option<f64> {
     let plugin = state::get()?;

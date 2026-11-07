@@ -191,11 +191,17 @@ pub unsafe extern "C" fn BrokerAsset(
             // instead of assuming they cost their full notional.
             *p_margin_cost = bridge::margin_cost_per_lot(symbol, price);
         }
-        if !p_roll_long.is_null() {
-            *p_roll_long = 0.0;
-        }
-        if !p_roll_short.is_null() {
-            *p_roll_short = 0.0;
+        if !p_roll_long.is_null() || !p_roll_short.is_null() {
+            // Daily funding per lot at the current rate. Zorro only uses it
+            // as an estimate: what a trade actually paid comes back through
+            // BrokerTrade's cost.
+            let (roll_long, roll_short) = bridge::rollover_per_lot(symbol);
+            if !p_roll_long.is_null() {
+                *p_roll_long = roll_long;
+            }
+            if !p_roll_short.is_null() {
+                *p_roll_short = roll_short;
+            }
         }
         1
     })

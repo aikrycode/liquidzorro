@@ -544,3 +544,28 @@ fn a_spot_trade_closes_whole_and_retires_what_cannot_be_sold() {
     println!("{pair} left in the wallet: {left}");
     assert!(left < 2.0, "{left} left: the close sold too little");
 }
+
+/// Zorro's rollover comes from the live funding rate: a perp reports equal
+/// and opposite figures for long and short, spot reports none, and a second
+/// asset in the same minute is answered from the one snapshot.
+#[test]
+#[ignore]
+fn reports_funding_as_rollover() {
+    login(None, BaseUrl::Testnet).expect("login should succeed");
+    let (rate, oracle) = perp_funding(TEST_PERP).expect("a perp should have a funding rate");
+    let (long, short) = rollover_per_lot(TEST_PERP);
+    println!(
+        "{TEST_PERP}: {:.6}%/h at {oracle} -> RollLong {long:e}, RollShort {short:e} per lot/day \
+         ({:.4} USDC per coin)",
+        rate * 100.0,
+        long * AMOUNT_SCALE
+    );
+    assert!(oracle > 0.0);
+    assert_eq!(long, -short, "long and short funding must mirror each other");
+    assert!(
+        (long + rate * 24.0 * oracle / AMOUNT_SCALE).abs() < 1e-15,
+        "a long pays the daily rate on one lot's notional"
+    );
+    assert!(state::cached_funding("BTC").is_some(), "the snapshot should cover every perp");
+    assert_eq!(rollover_per_lot(TEST_SPOT), (0.0, 0.0), "spot has no funding");
+}

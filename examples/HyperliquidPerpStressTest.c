@@ -187,9 +187,17 @@ function run()
 		Price = priceClose(0);
 		check("BrokerAsset prices the perpetual", Price > 0);
 
+		// Funding arrives as Zorro's rollover, per lot per day. The asset
+		// list says 0, so anything else came from the plugin; a long pays
+		// what a short receives, so the two mirror each other.
+		printf("
+RollLong %.3e  RollShort %.3e per lot/day", RollLong, RollShort);
+		check("BrokerAsset reports funding as rollover", RollLong != 0 && RollLong == -RollShort);
+
 		asset(SPOT_SYMBOL);
 		SpotPrice = priceClose(0);
 		check("BrokerAsset still prices a spot pair", SpotPrice > 0);
+		check("A spot pair reports no rollover", RollLong == 0 && RollShort == 0);
 		asset(PERP_SYMBOL);
 		printf("\n%s @ %.2f, %s @ %.4f", PERP_SYMBOL, Price, SPOT_SYMBOL, SpotPrice);
 

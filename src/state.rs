@@ -7,6 +7,7 @@ use std::ffi::CString;
 use std::os::raw::{c_char, c_int};
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Mutex, OnceLock, RwLock};
+use std::time::{Duration, Instant};
 
 use alloy::primitives::Address;
 use hyperliquid_rust_sdk::{ExchangeClient, InfoClient};
@@ -63,7 +64,15 @@ pub struct PluginState {
     /// Keeps `BrokerAsset` off the network on every call; filled on first
     /// read and kept current by `SET_LEVERAGE`.
     leverage: Mutex<HashMap<String, u32>>,
+    /// Every perp's funding rate and oracle price from one fetch, with when
+    /// it was taken. One request covers the whole universe, so `BrokerAsset`
+    /// polling several assets every tick still makes one call a minute.
+    funding: Mutex<Option<(Instant, HashMap<String, (f64, f64)>)>>,
 }
+
+/// How long a funding snapshot is reused. Hyperliquid's predicted rate
+/// drifts slowly and is settled hourly, so a minute old is current enough.
+pub const FUNDING_TTL: Duration = Duration::from_secs(60);
 
 static CALLBACKS: OnceLock<Callbacks> = OnceLock::new();
 // Holds a leaked `&'static PluginState` rather than the value itself, so
@@ -135,6 +144,7 @@ pub fn init(info_client: InfoClient, exchange_client: ExchangeClient, address: A
         trades: Mutex::new(HashMap::new()),
         assets: Mutex::new(HashMap::new()),
         leverage: Mutex::new(HashMap::new()),
+        funding: Mutex::new(None),
     }));
     *PLUGIN.write().unwrap_or_else(|e| e.into_inner()) = Some(state);
 }
@@ -310,6 +320,23 @@ pub fn cache_leverage(symbol: &str, leverage: u32) {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(symbol.to_string(), leverage);
+    }
+}
+
+/// `(hourly funding rate, oracle price)` for a perp, if the snapshot is
+/// younger than `FUNDING_TTL`. `None` means fetch again.
+pub fn cached_funding(symbol: &str) -> Option<Option<(f64, f64)>> {
+    let guard = get()?.funding.lock().unwrap_or_else(|e| e.into_inner());
+    let (at, rates) = guard.as_ref()?;
+    if at.elapsed() > FUNDING_TTL {
+        return None;
+    }
+    Some(rates.get(symbol).copied())
+}
+
+pub fn cache_funding(rates: HashMap<String, (f64, f64)>) {
+    if let Some(plugin) = get() {
+        *plugin.funding.lock().unwrap_or_else(|e| e.into_inner()) = Some((Instant::now(), rates));
     }
 }
 
