@@ -135,6 +135,14 @@ int budgetOk()
 function run()
 {
 	BarPeriod = 1;
+	// Crypto trades around the clock, but Zorro defaults to a Monday-to-
+	// Friday week and goes "Market closed" from Friday evening UTC until
+	// Sunday night -- a run started then sits idle for the whole weekend.
+	// BarMode 0 drops BR_WEEKEND, and the week runs Monday 00:00 to Sunday
+	// 23:59, so neither the bars nor the trading pause.
+	BarMode = 0;
+	StartWeek = 10000;
+	EndWeek = 72359;
 	LookBack = HISTORY_BARS;
 	TickTime = 1000;
 	set(LOGFILE);
