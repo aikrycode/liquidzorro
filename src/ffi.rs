@@ -85,6 +85,7 @@ pub unsafe extern "C" fn BrokerLogin(
         // switching Demo/Real or pasting a different key mid-session would
         // keep talking to the old one.
         if user.is_null() {
+            crate::feed::stop();
             state::clear();
             state::log_message("Hyperliquid: logged out");
             return 1;
@@ -156,7 +157,7 @@ pub unsafe extern "C" fn BrokerAsset(
             state::log_message(&format!("BrokerAsset({symbol}): not logged in"));
             return 0;
         }
-        let Some(price) = bridge::asset_price(symbol) else {
+        let Some((price, spread)) = bridge::quote(symbol) else {
             state::log_message(&format!("BrokerAsset({symbol}): price unavailable"));
             return 0;
         };
@@ -164,10 +165,10 @@ pub unsafe extern "C" fn BrokerAsset(
         if !p_price.is_null() {
             *p_price = price;
         }
-        // Placeholders until spot_meta_and_asset_contexts() is wired in.
         if !p_spread.is_null() {
-            *p_spread = 0.0;
+            *p_spread = spread;
         }
+        // Placeholder until 24h volume is read from the asset contexts.
         if !p_volume.is_null() {
             *p_volume = 0.0;
         }

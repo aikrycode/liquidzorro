@@ -569,3 +569,46 @@ fn reports_funding_as_rollover() {
     assert!(state::cached_funding("BTC").is_some(), "the snapshot should cover every perp");
     assert_eq!(rollover_per_lot(TEST_SPOT), (0.0, 0.0), "spot has no funding");
 }
+
+/// Prices come from the live feed: it starts with the session, agrees with
+/// the HTTP mids, gives perp and spot a real two-sided book, answers from
+/// memory, and is gone once the session ends.
+#[test]
+#[ignore]
+fn streams_prices_over_the_live_feed() {
+    login(None, BaseUrl::Testnet).expect("login should succeed");
+    let plugin = state::get().unwrap();
+    let (spot_pair, _) = test_pair(plugin);
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while crate::feed::mid(TEST_PERP).is_none() {
+        assert!(std::time::Instant::now() < deadline, "no mids pushed within 10s");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    let mids = runtime::get().block_on(plugin.info_client.all_mids()).unwrap();
+    for symbol in [TEST_PERP, spot_pair.as_str()] {
+        let streamed = crate::feed::mid(symbol).expect("streamed mid");
+        let polled: f64 = mids[symbol].parse().unwrap();
+        let book = crate::feed::book(symbol).expect("a book within the first-request wait");
+        let started = std::time::Instant::now();
+        let (ask, spread) = quote(symbol).unwrap();
+        let took = started.elapsed();
+        println!(
+            "{symbol}: mid {streamed} (http {polled}), bid {} ask {} spread {spread:.6} ({:.3}%), \
+             quote in {took:?}",
+            book.bid,
+            book.ask,
+            spread / ask * 100.0
+        );
+        assert!((streamed - polled).abs() / polled < 0.01, "streamed mid strays from http");
+        assert!(book.bid <= book.ask && spread >= 0.0);
+        assert!(spread > 0.0, "a live book should have a spread");
+        assert!(took < std::time::Duration::from_millis(50), "a quote should come from memory");
+    }
+
+    crate::feed::stop();
+    assert!(crate::feed::mid(TEST_PERP).is_none(), "a stopped feed must not answer");
+    assert!(quote(TEST_PERP).is_some(), "prices fall back to http");
+}
+

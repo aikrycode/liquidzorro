@@ -190,14 +190,18 @@ function run()
 		// Funding arrives as Zorro's rollover, per lot per day. The asset
 		// list says 0, so anything else came from the plugin; a long pays
 		// what a short receives, so the two mirror each other.
-		printf("
-RollLong %.3e  RollShort %.3e per lot/day", RollLong, RollShort);
+		printf("\nRollLong %.3e  RollShort %.3e per lot/day", RollLong, RollShort);
 		check("BrokerAsset reports funding as rollover", RollLong != 0 && RollLong == -RollShort);
+		printf("\nSpread %.2f (%.3f%%)", Spread, 100.*Spread/Price);
+		check("Perp spread comes from the live book", Spread > 0 && Spread < Price/10);
 
 		asset(SPOT_SYMBOL);
 		SpotPrice = priceClose(0);
 		check("BrokerAsset still prices a spot pair", SpotPrice > 0);
 		check("A spot pair reports no rollover", RollLong == 0 && RollShort == 0);
+		// Both books stream live, so both spreads are real: positive, and
+		// far below the price (a broken book would read as a huge one).
+		check("Spot spread comes from the live book", Spread > 0 && Spread < SpotPrice/10);
 		asset(PERP_SYMBOL);
 		printf("\n%s @ %.2f, %s @ %.4f", PERP_SYMBOL, Price, SPOT_SYMBOL, SpotPrice);
 

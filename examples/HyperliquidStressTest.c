@@ -124,8 +124,7 @@ void noteSale()
 	if(BeforeSell <= 0) return;
 	if(heldLots() >= BeforeSell) {
 		SellMisses++;
-		printf("
-        (that close sold nothing)");
+		printf("\n        (that close sold nothing)");
 	}
 	BeforeSell = 0;
 }
@@ -206,6 +205,10 @@ function run()
 		// --- asset pricing, two different symbols ---
 		Price = priceClose(0);
 		check("BrokerAsset prices PURR/USDC", Price > 0);
+		// The spread comes from the live order book; the asset list's
+		// figure is replaced by it, and 0 would mean the feed is not used.
+		printf("\nSpread %.4f (%.2f%%)", Spread, 100.*Spread/max(Price, 0.000001));
+		check("BrokerAsset reports a live spread", Spread > 0 && Spread < Price/10);
 
 		asset(ALT_SYMBOL);
 		AltPrice = priceClose(0);

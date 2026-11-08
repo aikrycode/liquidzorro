@@ -50,6 +50,11 @@ pub fn login(privkey: Option<&str>, base_url: BaseUrl) -> Result<alloy::primitiv
     })?;
 
     state::init(info_client, exchange_client, address);
+    // Live prices are an optimisation: without them every price comes over
+    // HTTP as before, so a failed feed is logged, not a failed login.
+    if let Err(e) = crate::feed::start(base_url) {
+        state::log_message(&format!("Hyperliquid: {e}; prices will be polled instead"));
+    }
     Ok(address)
 }
 
@@ -1045,8 +1050,27 @@ mod roll_tests {
     }
 }
 
-/// Last ask price for `symbol` via `all_mids`.
+/// What `BrokerAsset` reports: `(ask, ask - bid)`, as its contract asks.
+///
+/// From the live feed when it has a book for `symbol`. Otherwise the mid
+/// over HTTP with no spread, which is what every poll used to return.
+pub fn quote(symbol: &str) -> Option<(f64, f64)> {
+    crate::feed::maintain();
+    for line in crate::feed::take_log() {
+        state::log_message(&line);
+    }
+    if let Some(book) = crate::feed::book(symbol) {
+        return Some((book.ask, book.ask - book.bid));
+    }
+    asset_price(symbol).map(|mid| (mid, 0.0))
+}
+
+/// Mid price of `symbol`: from the live feed while it is up, else over
+/// HTTP via `all_mids`.
 pub fn asset_price(symbol: &str) -> Option<f64> {
+    if let Some(mid) = crate::feed::mid(symbol) {
+        return Some(mid);
+    }
     let plugin = state::get()?;
     let mids = runtime::get()
         .block_on(plugin.info_client.all_mids())
