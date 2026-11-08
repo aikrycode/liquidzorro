@@ -464,7 +464,7 @@ pub fn close_trade(trade_id: i32, amount: i32, limit: f64) -> Result<CloseOutcom
 
     let closed_qty = fill.unsigned_abs() as f64 / AMOUNT_SCALE;
     let direction = if info.is_buy { 1.0 } else { -1.0 };
-    let profit = direction * (price - info.entry_price) * closed_qty;
+    let mut profit = direction * (price - info.entry_price) * closed_qty;
 
     let fee = state::get_trade(close_id).map_or(0.0, |t| t.entry_fee);
     state::add_close_fee(trade_id, fee);
@@ -480,8 +480,10 @@ pub fn close_trade(trade_id: i32, amount: i32, limit: f64) -> Result<CloseOutcom
     if closes_whole_trade && remaining > 0.0 && matches!(plan, Some(SpotClose::Sell(_))) {
         state::log_message(&format!(
             "trade {trade_id}: {remaining} {symbol} left after the close cannot be sold; \
-retired with the trade and left in the wallet"
+retired with the trade as lost ({})",
+            DUST_NOTE
         ));
+        profit += retired_profit(info.entry_price, remaining);
         state::reduce_trade(trade_id, remaining);
         remaining = 0.0;
         fill = -amount.abs();
@@ -547,8 +549,22 @@ fn spot_close_plan(
     })
 }
 
+/// Why retired coins are booked as worth nothing, for the log.
+const DUST_NOTE: &str = "Hyperliquid sweeps unsellable spot balances from the wallet";
+
+/// What Zorro is told a retired remainder earned: its entry cost, lost.
+///
+/// A spot balance under one size step can never be sold, and Hyperliquid
+/// sweeps it away -- on testnet a leftover of nearly one PURR went within
+/// minutes, with no fill, transfer or USDC in return. Booking it at market
+/// instead told Zorro each PURR cycle cost far less than the account
+/// lost. Only spot buys are retired, so the trade is always long.
+fn retired_profit(entry_price: f64, qty: f64) -> f64 {
+    -entry_price * qty
+}
+
 /// Marks the rest of a trade closed without an order, because no order for
-/// it can fill. The coins stay in the wallet; Zorro stops tracking them.
+/// it can fill. Zorro stops tracking the coins and books them as lost.
 fn retire_as_dust(
     trade_id: i32,
     info: &state::TradeInfo,
@@ -559,16 +575,16 @@ fn retire_as_dust(
 ) -> CloseOutcome {
     let qty = info.remaining_sz;
     state::log_message(&format!(
-        "trade {trade_id}: retiring the last {qty} {symbol} unsold ({reason}); left in the wallet"
+        "trade {trade_id}: retiring the last {qty} {symbol} unsold ({reason}); booked as lost ({})",
+        DUST_NOTE
     ));
     state::reduce_trade(trade_id, qty);
-    let direction = if info.is_buy { 1.0 } else { -1.0 };
     let total_fees = state::get_trade(trade_id).map_or(info.total_fees(), |t| t.total_fees());
     CloseOutcome {
         symbol: symbol.to_string(),
         price,
         fill: -amount.abs(),
-        profit: direction * (price - info.entry_price) * qty,
+        profit: retired_profit(info.entry_price, qty),
         cost: -total_fees,
         fee: 0.0,
         remaining: 0.0,

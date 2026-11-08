@@ -10,39 +10,39 @@
 // Demo = testnet. [Trade] mode only.
 //
 // Budget: holds at most ~$75 of testnet USDC at once and loses only
-// spread/slippage (a few dollars across a full run). Aborts immediately if
-// the account balance would drop under MIN_BALANCE.
+// spread and fees (well under a dollar across a full run). Aborts
+// immediately if the account balance would drop under MIN_BALANCE.
 //
-// Traded on PURR/USDC, the canonical testnet spot pair. HYPE/USDC ("@1035")
-// is unusable for this: it quotes a ~22% spread and ran from $188 to $5480
-// inside two hours, which put one 0.01-coin size step at $54.80 -- above the
-// whole per-cycle budget -- and left the cost and balance assertions unable
-// to tell a bug from the spread.
+// Traded on IBTC/USDC ("@460"), which a testnet market maker quotes at ~0.3%
+// with thousands of dollars on each side, in 0.01-coin size steps worth
+// ~$0.001. The step size decides the cost: a spot buy pays its fee in the
+// coin, so every round trip leaves a fraction of a step that can never be
+// sold, and Hyperliquid sweeps it from the wallet within minutes. On
+// PURR/USDC, whose step is one whole coin, that was a whole coin per cycle.
+// HYPE/USDC ("@1035") is unusable: it quotes a ~22% spread and ran from
+// $188 to $5480 inside two hours.
 
-#define HL_SYMBOL       "PURR/USDC"  // canonical pair; exchange symbol is the same
+#define HL_SYMBOL       "IBTC/USDC"  // exchange symbol "@460", via the asset list
 #define ALT_SYMBOL      "BTC/USD"    // priced only -- too coarse to trade at this size
 #define MIN_BALANCE     750          // hard floor; abort rather than spend past this
-// Per cycle, split in three. PURR trades in whole coins and a sell must
-// clear $10 at its slippage-adjusted price, so every chunk needs at least
-// 3 whole coins; at ~$4.50 that takes 13 coins, and the smallest chunk at
-// $45 floored to 2 coins ($9) and was refused dozens of times in one run.
+// Per cycle, split in three. Every chunk must clear the exchange's $10
+// minimum at its slippage-adjusted price, 5% under the bid, so the
+// smallest (30%) chunk needs ~$11; 60 leaves it at ~$18.
 #define TRADE_USD       60
-// Resting limit notional. PURR trades in whole coins, so the lot count
-// rounds down by up to one coin; 15 keeps the order clear of the exchange's
-// $10 minimum even after that haircut.
+// Resting limit notional, kept clear of the $10 minimum.
 #define LIMIT_USD       15
 #define CYCLES          2            // market round trips
 #define HISTORY_BARS    50           // candles to pull via BrokerHistory2
 
 #define AMOUNT_SCALE    100000.
-// One exchange size step for HL_SYMBOL: PURR has szDecimals 0, so it
-// trades in whole coins, which is 100000 lots. Less than this cannot be
-// sold at all, so it is the floor a close can reach, not a tolerance.
-#define DUST_THRESHOLD_LOTS 100000.
+// One exchange size step for HL_SYMBOL: IBTC has szDecimals 2, so it
+// trades in 0.01 coins, which is 1000 lots. Less than this cannot be sold
+// at all, so it is the floor a close can reach, not a tolerance.
+#define DUST_THRESHOLD_LOTS 1000.
 // A sweep that stops making progress would otherwise retry forever.
 #define MAX_SWEEPS      3
-// One whole coin, the unit chunks are cut in.
-#define STEP_LOTS       100000.
+// One size step, the unit chunks are cut in.
+#define STEP_LOTS       1000.
 
 // BrokerCommand codes (trading.h)
 #define CMD_GET_POSITION   53
@@ -204,7 +204,7 @@ function run()
 
 		// --- asset pricing, two different symbols ---
 		Price = priceClose(0);
-		check("BrokerAsset prices PURR/USDC", Price > 0);
+		check("BrokerAsset prices the spot pair", Price > 0);
 		// The spread comes from the live order book; the asset list's
 		// figure is replaced by it, and 0 would mean the feed is not used.
 		printf("\nSpread %.4f (%.2f%%)", Spread, 100.*Spread/max(Price, 0.000001));
@@ -261,8 +261,9 @@ function run()
 			Phase = PH_CYCLE_END;
 			return;
 		}
-		// Uneven split in whole coins: a fractional chunk is floored by the
-		// plugin, and 2.998 coins floored to 2 is under the $10 minimum.
+		// Uneven split in whole size steps: a fractional chunk is floored by
+		// the plugin, and on a coarse pair that can take it under the $10
+		// minimum (one run had such a close refused dozens of times).
 		// The last chunk takes the remainder, fractions and all, so it
 		// closes the whole trade and the plugin retires the sliver with it.
 		Chunk1 = floor(Held*0.4/STEP_LOTS)*STEP_LOTS;

@@ -5,14 +5,25 @@
 
 use super::*;
 
-/// Spot pair the tests trade: PURR/USDC, the canonical testnet pair, quoting
-/// around 1% with one whole coin -- about $4.50 -- as its size step, so a $12
-/// order is several steps wide.
+/// Spot pair the tests trade: IBTC/USDC ("@460"), quoted by a testnet
+/// market maker at ~0.3% with ~$5,800 in the top three levels each side,
+/// and a 0.01-coin size step worth ~$0.001.
+///
+/// The step is what matters. A spot buy pays its fee in the coin, so a
+/// round trip always leaves a fraction of a step unsold, and Hyperliquid
+/// sweeps that from the wallet within minutes. On PURR/USDC, whose step is
+/// one whole coin, that cost a whole coin a round trip; here it is a tenth of a
+/// cent. If this pair stops quoting, pick another USDC pair with
+/// `sz_decimals >= 2`, a two-sided book and a sub-1% spread.
 ///
 /// Not HYPE/USDC ("@1035"): it quotes a ~22% spread, and its run from $188 to
 /// $5480 inside two hours put one 0.01-coin step at $54.80, so a $12 order
 /// rounded to zero size and was rejected outright.
-const TEST_SPOT: &str = "PURR/USDC";
+const TEST_SPOT: &str = "@460";
+
+/// Spot pair whose size step is one whole coin, for the one test that needs
+/// an unsellable sliver. Costs about one PURR a run for that reason.
+const COARSE_SPOT: &str = "PURR/USDC";
 
 /// Perp the tests trade: liquid on testnet, with `sz_decimals` fine enough
 /// to reach the $10 minimum.
@@ -47,16 +58,20 @@ fn lists_spot_pairs() {
     }
 }
 
-/// `(pair_name, base_token_name)` for `TEST_SPOT`, e.g. `("PURR/USDC", "PURR")`.
+/// `(pair_name, base_token_name)` for `TEST_SPOT`, e.g. `("@460", "IBTC")`.
 fn test_pair(plugin: &state::PluginState) -> (String, String) {
+    pair_named(plugin, TEST_SPOT)
+}
+
+fn pair_named(plugin: &state::PluginState, name: &str) -> (String, String) {
     let spot_meta = runtime::get()
         .block_on(plugin.info_client.spot_meta())
         .expect("spot_meta should succeed");
     let asset = spot_meta
         .universe
         .iter()
-        .find(|a| a.name == TEST_SPOT)
-        .unwrap_or_else(|| panic!("{TEST_SPOT} not in the spot universe"));
+        .find(|a| a.name == name)
+        .unwrap_or_else(|| panic!("{name} not in the spot universe"));
     let base_token = spot_meta
         .tokens
         .iter()
@@ -504,13 +519,14 @@ fn a_stop_rests_on_the_exchange_and_leaves_with_the_trade() {
 /// run hit: a buy that delivers less than it filled because the fee is
 /// taken in the coin, a fee booked in the wrong currency, and a trade whose
 /// last sliver no order can sell. Buys 4 whole PURR (~$18) and closes the
-/// whole trade in one call; the sliver stays in the wallet as dust.
+/// whole trade in one call; the sliver is booked as lost, because
+/// Hyperliquid sweeps it from the wallet within minutes.
 #[test]
 #[ignore]
 fn a_spot_trade_closes_whole_and_retires_what_cannot_be_sold() {
     login(None, BaseUrl::Testnet).expect("login should succeed");
     let plugin = state::get().unwrap();
-    let (pair, _) = test_pair(plugin);
+    let (pair, _) = pair_named(plugin, COARSE_SPOT);
     let price = asset_price(&pair).expect("price");
     // Whole coins, so the net (minus the fee) still floors to 3 = over $10.
     let coins = (15.0 / price).ceil();
@@ -543,6 +559,19 @@ fn a_spot_trade_closes_whole_and_retires_what_cannot_be_sold() {
     let left = net_position(&pair).unwrap_or(0.0);
     println!("{pair} left in the wallet: {left}");
     assert!(left < 2.0, "{left} left: the close sold too little");
+
+    // The sold coins earn the price move; the unsellable sliver earns
+    // minus its cost. Booked at market instead, it hid about a coin's worth a cycle.
+    let sold = (coins - 1.0).max(0.0);
+    let sliver = fill as f64 / AMOUNT_SCALE - sold;
+    let expected = (outcome.price - trade.entry_price) * sold - trade.entry_price * sliver;
+    println!("profit told to Zorro {:.4}, expected {expected:.4} ({sliver} lost)", outcome.profit);
+    assert!(sliver > 0.0 && sliver < 1.0, "sliver {sliver} should be under one coin");
+    assert!(
+        (outcome.profit - expected).abs() < 0.01,
+        "profit {} should book the sliver as lost ({expected})",
+        outcome.profit
+    );
 }
 
 /// Zorro's rollover comes from the live funding rate: a perp reports equal

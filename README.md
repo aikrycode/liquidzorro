@@ -125,7 +125,7 @@ What it covers:
 - A resting limit order placed below market, then cancelled.
 - An order under the exchange's $10 minimum, to confirm it is refused cleanly.
 
-It holds at most ~$57 at once and loses only spread. Edit `MIN_BALANCE` (default 750) to set the floor it refuses to trade below, and `CYCLES` to change how many round trips it makes.
+It trades IBTC/USDC (`@460`), a testnet pair with a ~0.3% spread and 0.01-coin size steps, holds at most ~$75 at once, and loses only spread and fees -- well under a dollar a run. Edit `MIN_BALANCE` (default 750) to set the floor it refuses to trade below, and `CYCLES` to change how many round trips it makes.
 
 ## Support
 
@@ -143,4 +143,5 @@ This address only ever changes in a signed commit -- before sending, check that 
 
 ## Known Issues
 
+- **Spot leftovers under one size step are lost:** a Hyperliquid spot buy pays its fee in the coin bought, so closing the trade always leaves a fraction of one size step that no order can sell. The plugin closes the trade anyway and books that fraction as a loss, because Hyperliquid sweeps such balances from the wallet -- on testnet within minutes, with nothing returned. On fine-stepped pairs this is a fraction of a cent; on PURR/USDC, which trades in whole coins, it is up to one coin (~$4.50) per trade.
 - **64-bit Zorro:** the plugin loads and "Hyperliquid" appears in the Broker dropdown, but strategies don't start -- cause not yet established. Use the 32-bit path, which is verified end to end.
