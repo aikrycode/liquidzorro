@@ -408,7 +408,8 @@ const GET_BROKERZONE: c_int = 40;
 /// `candles_snapshot` tops out at 5000 per request.
 const GET_MAXTICKS: c_int = 43;
 
-/// SET_ORDERTYPE: 0 = fill-or-kill, 1 = immediate-or-cancel, 2 = GTC.
+/// SET_ORDERTYPE: 0 = fill-or-kill, 1 = immediate-or-cancel, 2 = GTC, and
+/// plugin-specific 4 = post-only GTC (Hyperliquid "Alo").
 /// Echoing the value back is how a plugin tells Zorro it honours order
 /// types at all -- returning 0 makes Zorro assume limit orders are
 /// unsupported and skip them entirely.
@@ -417,6 +418,12 @@ const SET_ORDERTYPE: c_int = 157;
 /// DO_CANCEL: cancel the resting order with the Zorro trade id in
 /// `parameter`.
 const DO_CANCEL: c_int = 301;
+
+/// DO_MODIFY (plugin-specific): move a resting order in place. `parameter`
+/// points at three `var`s: the Zorro trade id, the new limit price, and the
+/// new size in lots (0 keeps the size). Returns 1 if the order rests at the
+/// new price, 2 if the new price filled it at once, 0 if it was refused.
+const DO_MODIFY: c_int = 2001;
 
 /// SET_SYMBOL: the asset subsequent commands apply to.
 const SET_SYMBOL: c_int = 132;
@@ -475,6 +482,34 @@ pub unsafe extern "C" fn BrokerCommand(command: c_int, parameter: isize) -> f64 
                 Err(e) => {
                     state::log_message(&format!(
                         "BrokerCommand(DO_CANCEL, {trade_id}) FAILED: {e}"
+                    ));
+                    0.0
+                }
+            }
+        }
+        DO_MODIFY => {
+            let args = parameter as *const f64;
+            if args.is_null() {
+                state::log_message("BrokerCommand(DO_MODIFY): no arguments");
+                return 0.0;
+            }
+            let (trade_id, limit, lots) = (*args as i32, *args.add(1), *args.add(2) as i32);
+            match bridge::modify_order(trade_id, limit, lots) {
+                Ok(0) => {
+                    state::log_message(&format!(
+                        "BrokerCommand(DO_MODIFY): {trade_id} now rests at {limit}"
+                    ));
+                    1.0
+                }
+                Ok(filled) => {
+                    state::log_message(&format!(
+                        "BrokerCommand(DO_MODIFY): {trade_id} filled {filled} lots at the new price"
+                    ));
+                    2.0
+                }
+                Err(e) => {
+                    state::log_message(&format!(
+                        "BrokerCommand(DO_MODIFY, {trade_id}) FAILED: {e}"
                     ));
                     0.0
                 }

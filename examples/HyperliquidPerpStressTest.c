@@ -18,7 +18,9 @@
 // aborts below MIN_BALANCE.
 
 #define PERP_SYMBOL     "ETH-PERP"   // Hyperliquid symbol "ETH"
-#define SPOT_SYMBOL     "HYPE/USDC"  // priced only, to prove mixed universes
+// Priced only, to prove mixed universes. Not HYPE/USDC: its testnet book
+// has quoted 756 / 2267, a spread no live-book check should accept.
+#define SPOT_SYMBOL     "FTEST/USDC"
 #define MIN_BALANCE     750          // hard floor; abort rather than spend past this
 #define TRADE_USD       15           // notional per position; must clear $10
 #define LIMIT_USD       15           // resting limit order notional
@@ -40,8 +42,13 @@
 #define CMD_GET_POSITION   53
 #define CMD_SET_ORDERTYPE  157
 #define CMD_DO_CANCEL      301
+// Plugin-specific: move a resting order in place. Takes three vars:
+// trade id, new limit price, new lots (0 keeps the size).
+#define CMD_DO_MODIFY      2001
 #define ORDERTYPE_GTC      2
 #define ORDERTYPE_IOC      1
+// Plugin-specific: GTC that may only add liquidity (Hyperliquid "Alo").
+#define ORDERTYPE_POST_ONLY 4
 
 #define PH_PREFLIGHT    0
 #define PH_LEVERAGE     1
@@ -64,6 +71,8 @@
 #define PH_REPORT       18
 #define PH_STOP_FLAT    20
 #define PH_DONE         19
+#define PH_LIMIT_MODIFY 21
+#define PH_POST_ONLY    22
 
 int Phase;
 int Passed, Failed;
@@ -424,6 +433,27 @@ function run()
 			return;
 		}
 		printf("\nPending limit order registered, trade id %d", LimitTradeID);
+		Phase = PH_LIMIT_MODIFY;
+		return;
+	}
+
+	// Moves the resting order further from the market and makes it bigger
+	// in one request, the way a strategy chases or backs off a quote.
+	// Still far below market, so it cannot fill.
+	if(Phase == PH_LIMIT_MODIFY) {
+		var Price = priceClose(0);
+		var Args[3];
+		var Result;
+		int StillPending = 0;
+		if(Price <= 0) return;
+		Args[0] = LimitTradeID;
+		Args[1] = Price*0.55;
+		Args[2] = ceil(1.5*LIMIT_USD/(Price*0.55)*AMOUNT_SCALE);
+		Result = brokerCommand(CMD_DO_MODIFY, Args);
+		printf("\nDO_MODIFY %d -> %.0f lots @ %.2f: %.0f", LimitTradeID, Args[2], Args[1], Result);
+		check("DO_MODIFY moves the resting order in place", Result == 1);
+		for(open_trades) if(TradeID == LimitTradeID) StillPending = 1;
+		check("The modified order is still Zorro's pending trade", StillPending);
 		Phase = PH_LIMIT_CANCEL;
 		return;
 	}
@@ -436,6 +466,26 @@ function run()
 		// status page for the rest of the run. cancelTrade drops it from
 		// the list without sending anything to the broker.
 		if(Result == 1) { LimitCancelled = 1; cancelTrade(LimitTradeID); }
+		Phase = PH_POST_ONLY;
+		return;
+	}
+
+	// A post-only buy priced through the ask must be refused, not filled
+	// as a taker: that is the whole point of post-only.
+	if(Phase == PH_POST_ONLY) {
+		var Price = priceClose(0);
+		var Before = heldLots();
+		TRADE* Entered;
+		if(Price <= 0) return;
+		printf("\n--- post-only ---");
+		brokerCommand(CMD_SET_ORDERTYPE, ORDERTYPE_POST_ONLY);
+		OrderLimit = Price*1.02;
+		Lots = ceil(LIMIT_USD/Price*AMOUNT_SCALE);
+		Entered = enterLong();
+		OrderLimit = 0;
+		brokerCommand(CMD_SET_ORDERTYPE, ORDERTYPE_IOC);
+		check("A post-only order through the book is refused", Entered == 0);
+		check("The refused post-only order left the position unchanged", isFlat(heldLots() - Before));
 		Phase = PH_REJECT;
 		return;
 	}

@@ -5,21 +5,24 @@
 
 use super::*;
 
-/// Spot pair the tests trade: IBTC/USDC ("@460"), quoted by a testnet
-/// market maker at ~0.3% with ~$5,800 in the top three levels each side,
-/// and a 0.01-coin size step worth ~$0.001.
+/// Spot pair the tests trade: FTEST/USDC ("@171"), quoted by a testnet
+/// market maker at ~0.3% with ~$25,000 in the top three levels each side,
+/// steady at ~$1.02 for weeks, in 0.01-coin size steps worth ~$0.01.
 ///
 /// The step is what matters. A spot buy pays its fee in the coin, so a
 /// round trip always leaves a fraction of a step unsold, and Hyperliquid
 /// sweeps that from the wallet within minutes. On PURR/USDC, whose step is
-/// one whole coin, that cost a whole coin a round trip; here it is a tenth of a
+/// one whole coin, that cost a whole coin a round trip; here it is at most a
 /// cent. If this pair stops quoting, pick another USDC pair with
-/// `sz_decimals >= 2`, a two-sided book and a sub-1% spread.
+/// `sz_decimals >= 2`, a two-sided book, a sub-1% spread, a steady price,
+/// and a price high enough that an order fits Zorro's int amount: at
+/// AMOUNT_SCALE 100000 lots a coin, $60 of a $0.00226 coin (IBTC, tried
+/// first) is 2.65e9 lots, past i32's 2.1e9.
 ///
 /// Not HYPE/USDC ("@1035"): it quotes a ~22% spread, and its run from $188 to
 /// $5480 inside two hours put one 0.01-coin step at $54.80, so a $12 order
 /// rounded to zero size and was rejected outright.
-const TEST_SPOT: &str = "@460";
+const TEST_SPOT: &str = "@171";
 
 /// Spot pair whose size step is one whole coin, for the one test that needs
 /// an unsellable sliver. Costs about one PURR a run for that reason.
@@ -58,7 +61,7 @@ fn lists_spot_pairs() {
     }
 }
 
-/// `(pair_name, base_token_name)` for `TEST_SPOT`, e.g. `("@460", "IBTC")`.
+/// `(pair_name, base_token_name)` for `TEST_SPOT`, e.g. `("@171", "FTEST")`.
 fn test_pair(plugin: &state::PluginState) -> (String, String) {
     pair_named(plugin, TEST_SPOT)
 }
@@ -641,3 +644,125 @@ fn streams_prices_over_the_live_feed() {
     assert!(quote(TEST_PERP).is_some(), "prices fall back to http");
 }
 
+
+/// Post-only (SET_ORDERTYPE 4, Hyperliquid "Alo"): a buy under the bid
+/// rests like any GTC order, and one priced through the ask is refused
+/// instead of filling as a taker. Neither fills, so nothing is spent.
+#[test]
+#[ignore]
+fn post_only_rests_or_is_refused_but_never_takes() {
+    login(None, BaseUrl::Testnet).expect("login should succeed");
+    state::set_order_type(ORDER_TYPE_POST_ONLY);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let book = loop {
+        if let Some(book) = crate::feed::book(TEST_PERP) {
+            break book;
+        }
+        assert!(std::time::Instant::now() < deadline, "no live book within 10s");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+
+    let under = book.bid * 0.95;
+    let units = (minimum_qty(under) * AMOUNT_SCALE).round() as i32;
+    let (id, px, fill) = place_order(TEST_PERP, units, under, false, 0.0)
+        .expect("a post-only buy under the bid should rest");
+    println!("rested post-only {TEST_PERP} buy as {id} @ {px}");
+    assert_eq!(fill, 0, "a post-only order must not fill on entry");
+    cancel_order(id).expect("cancel");
+
+    let through = book.ask * 1.02;
+    let units = (minimum_qty(through) * AMOUNT_SCALE).round() as i32;
+    let refused = place_order(TEST_PERP, units, through, false, 0.0);
+    println!("post-only buy through the ask: {refused:?}");
+    let err = refused.expect_err("a post-only buy through the ask must be refused");
+    assert!(err.contains("post-only"), "the refusal should say why: {err}");
+
+    let market = place_order(TEST_PERP, units, 0.0, false, 0.0);
+    assert!(market.is_err(), "a post-only market order must be refused before sending");
+
+    state::set_order_type(1);
+    assert_eq!(net_position(TEST_PERP).unwrap_or(0.0), 0.0, "nothing may have filled");
+}
+
+/// DO_MODIFY moves a resting order in place: the exchange then shows the
+/// new price and size, Zorro's trade follows the order even if its id
+/// changed, a post-only move through the book is refused without losing
+/// the order, and a cancelled order cannot be modified. Nothing fills.
+#[test]
+#[ignore]
+fn modifies_a_resting_order_in_place() {
+    login(None, BaseUrl::Testnet).expect("login should succeed");
+    let plugin = state::get().unwrap();
+    state::set_order_type(ORDER_TYPE_POST_ONLY);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let book = loop {
+        if let Some(book) = crate::feed::book(TEST_PERP) {
+            break book;
+        }
+        assert!(std::time::Instant::now() < deadline, "no live book within 10s");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+
+    let first = book.bid * 0.95;
+    let units = (minimum_qty(first) * AMOUNT_SCALE).round() as i32;
+    let (id, _, fill) = place_order(TEST_PERP, units, first, false, 0.0).expect("rest");
+    assert_eq!(fill, 0);
+    let before = state::get_trade(id).unwrap();
+
+    let moved = book.bid * 0.93;
+    let bigger = units * 3 / 2;
+    let filled = modify_order(id, moved, bigger).expect("modify should be accepted");
+    assert_eq!(filled, 0, "a buy 7% under the bid must not fill");
+    let after = state::get_trade(id).unwrap();
+    let on_exchange = runtime::get()
+        .block_on(plugin.info_client.query_order_by_oid(plugin.address, after.oid))
+        .unwrap()
+        .order
+        .expect("the modified order");
+    println!(
+        "modified {id}: oid {} -> {}, {} @ {} -> {} @ {} (exchange: {} @ {}, tif {:?})",
+        before.oid, after.oid, before.entry_sz, before.entry_price, after.entry_sz,
+        after.entry_price, on_exchange.order.sz, on_exchange.order.limit_px, on_exchange.order.tif
+    );
+    assert_eq!(on_exchange.status, "open");
+    assert!((on_exchange.order.limit_px.parse::<f64>().unwrap() - after.entry_price).abs() < 1e-9);
+    assert!((on_exchange.order.sz.parse::<f64>().unwrap() - after.entry_sz).abs() < 1e-9);
+    assert!(after.entry_sz > before.entry_sz, "the size should have grown");
+    assert_eq!(on_exchange.order.tif.as_deref(), Some("Alo"), "post-only must survive the modify");
+    let (.., fill_state) = trade_status(id).expect("status");
+    assert_eq!(fill_state, 0, "Zorro must see the modified order as resting, not gone");
+
+    let refused = modify_order(id, book.ask * 1.02, 0);
+    println!("post-only modify through the ask: {refused:?}");
+    assert!(refused.is_err(), "a post-only modify through the ask must be refused");
+    let (.., fill_state) = trade_status(id).expect("status");
+    assert_eq!(fill_state, 0, "a refused modify must leave the order resting");
+
+    cancel_order(id).expect("cancel");
+    assert!(modify_order(id, moved, 0).is_err(), "a cancelled order cannot be modified");
+    state::set_order_type(1);
+    assert_eq!(net_position(TEST_PERP).unwrap_or(0.0), 0.0, "nothing may have filled");
+}
+
+/// Cleanup: cancels every order still resting on the account, for when a
+/// test fails between placing an order and cancelling it.
+#[test]
+#[ignore]
+fn cancels_leftover_orders() {
+    login(None, BaseUrl::Testnet).expect("login should succeed");
+    let plugin = state::get().unwrap();
+    let open = runtime::get()
+        .block_on(plugin.info_client.open_orders(plugin.address))
+        .expect("open orders");
+    for order in &open {
+        let result = runtime::get().block_on(plugin.exchange_client.cancel(
+            ClientCancelRequest { asset: order.coin.clone(), oid: order.oid },
+            None,
+        ));
+        println!("cancel {} {} {} @ {}: {result:?}", order.coin, order.side, order.sz, order.limit_px);
+    }
+    let left = runtime::get()
+        .block_on(plugin.info_client.open_orders(plugin.address))
+        .expect("open orders");
+    assert!(left.is_empty(), "still resting: {left:?}");
+}

@@ -11,11 +11,13 @@
 //! market would have no book after a reconnect. `l2Book` sends a snapshot
 //! on every (re)subscribe, for perps and spot alike.
 //!
-//! The feed is only trusted while it is visibly alive: Hyperliquid pushes
-//! all mids every block, so if none has arrived for `STALE_AFTER` the
-//! connection is treated as down and callers fall back to HTTP. A dropped
-//! connection is never a missing price, only a slower one, and one down for
-//! `RESTART_AFTER` is replaced.
+//! The feed is only trusted while it is visibly alive: if nothing at all
+//! has arrived for `STALE_AFTER` the connection is treated as down and
+//! callers fall back to HTTP. A dropped connection is never a missing
+//! price, only a slower one, and one down for `RESTART_AFTER` is replaced.
+//! Any push counts, not just all-mids: on testnet those come only every
+//! 5-6 seconds (35 in three minutes), while a liquid book updates many
+//! times a second.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, Weak};
@@ -26,13 +28,15 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 
 use crate::runtime;
 
-/// How long without an all-mids push before the feed counts as down.
-pub const STALE_AFTER: Duration = Duration::from_secs(10);
+/// How long without any push before the feed counts as down. Several
+/// all-mids intervals, so a slow one is not mistaken for a dead line: a
+/// 10s limit with 30s restarts restarted the feed twice in one Zorro run.
+pub const STALE_AFTER: Duration = Duration::from_secs(30);
 
 /// How long a feed may stay down before it is replaced. The SDK reconnects
 /// on a clean close, but a connection reset can leave it repeating the same
 /// read error forever instead.
-const RESTART_AFTER: Duration = Duration::from_secs(30);
+const RESTART_AFTER: Duration = Duration::from_secs(90);
 
 /// How long a first request for an asset waits for its book snapshot, so
 /// Zorro's first poll already gets a real spread.
@@ -52,8 +56,8 @@ pub struct Book {
 #[derive(Default)]
 struct Data {
     mids: HashMap<String, f64>,
-    /// When the last all-mids push arrived; `None` while disconnected.
-    mids_at: Option<Instant>,
+    /// When the last push of any kind arrived; `None` while disconnected.
+    last_push: Option<Instant>,
     books: HashMap<String, Book>,
     /// Assets with a book subscription, kept across reconnects because the
     /// SDK resubscribes them itself.
@@ -139,7 +143,7 @@ pub fn maintain() {
     let Some(feed) = current() else { return };
     let (stuck, books) = {
         let data = feed.data.lock().unwrap_or_else(|e| e.into_inner());
-        let last_sign_of_life = data.mids_at.unwrap_or(feed.started_at);
+        let last_sign_of_life = data.last_push.unwrap_or(feed.started_at);
         (last_sign_of_life.elapsed() > RESTART_AFTER, data.subscribed.clone())
     };
     if !stuck {
@@ -170,9 +174,10 @@ fn apply(data: &mut Data, message: Message, now: Instant) {
                     data.mids.insert(coin, mid);
                 }
             }
-            data.mids_at = Some(now);
+            data.last_push = Some(now);
         }
         Message::L2Book(l2) => {
+            data.last_push = Some(now);
             let top = |side: usize| l2.data.levels.get(side).and_then(|lv| lv.first()).cloned();
             match book_from_levels(&[top(0), top(1)]) {
                 Some(book) => {
@@ -190,7 +195,7 @@ fn apply(data: &mut Data, message: Message, now: Instant) {
         Message::NoData => {
             data.mids.clear();
             data.books.clear();
-            data.mids_at = None;
+            data.last_push = None;
             data.log("Hyperliquid: live feed dropped, reconnecting".to_string());
         }
         Message::HyperliquidError(e) => {
@@ -211,7 +216,7 @@ fn book_from_levels(levels: &[Option<BookLevel>]) -> Option<Book> {
 }
 
 fn is_live(data: &Data, now: Instant) -> bool {
-    matches!(data.mids_at, Some(at) if now.duration_since(at) <= STALE_AFTER)
+    matches!(data.last_push, Some(at) if now.duration_since(at) <= STALE_AFTER)
 }
 
 /// Lines the feed wants in Zorro's log. Call from Zorro's own thread.
@@ -309,7 +314,7 @@ mod tests {
         let now = Instant::now();
         let mut data = Data::default();
         assert!(!is_live(&data, now), "nothing received yet");
-        data.mids_at = Some(now);
+        data.last_push = Some(now);
         assert!(is_live(&data, now + STALE_AFTER));
         assert!(!is_live(&data, now + STALE_AFTER + Duration::from_millis(1)));
     }
@@ -322,12 +327,31 @@ mod tests {
         data.mids.insert("ETH".into(), 2250.0);
         data.books.insert("ETH".into(), Book { bid: 2250.0, ask: 2250.5 });
         data.subscribed.insert("ETH".into());
-        data.mids_at = Some(now);
+        data.last_push = Some(now);
         apply(&mut data, Message::NoData, now);
         assert!(data.mids.is_empty() && data.books.is_empty());
         assert!(!is_live(&data, now));
         assert!(data.subscribed.contains("ETH"), "the SDK resubscribes, so keep the record");
         assert_eq!(data.pending_log.len(), 1);
+    }
+
+    /// A book push alone keeps the feed alive: testnet all-mids pushes can
+    /// be 6 seconds apart while a liquid book updates continuously.
+    #[test]
+    fn a_book_push_counts_as_a_sign_of_life() {
+        let now = Instant::now();
+        let mut data = Data::default();
+        let level = |px: &str| BookLevel { px: px.to_string(), sz: "1".to_string(), n: 1 };
+        let l2 = hyperliquid_rust_sdk::L2Book {
+            data: hyperliquid_rust_sdk::L2BookData {
+                coin: "ETH".to_string(),
+                time: 0,
+                levels: vec![vec![level("2245.2")], vec![level("2245.5")]],
+            },
+        };
+        apply(&mut data, Message::L2Book(l2), now);
+        assert!(is_live(&data, now));
+        assert_eq!(data.books["ETH"], Book { bid: 2245.2, ask: 2245.5 });
     }
 
     /// A reset connection repeats its read error many times a second.
@@ -347,5 +371,69 @@ mod tests {
             data.log(format!("line {i}"));
         }
         assert_eq!(data.pending_log.len(), MAX_PENDING_LOG);
+    }
+}
+
+#[cfg(test)]
+mod live {
+    /// Diagnostic: how often all-mids pushes arrive over three minutes.
+    #[test]
+    #[ignore]
+    fn times_the_mids_pushes() {
+        super::start(hyperliquid_rust_sdk::BaseUrl::Testnet).expect("feed");
+        let feed = super::current().unwrap();
+        let mut last = None;
+        let mut max_gap = std::time::Duration::ZERO;
+        let mut pushes = 0;
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(180);
+        while std::time::Instant::now() < end {
+            let at = feed.data.lock().unwrap().last_push;
+            if at != last {
+                if let (Some(a), Some(b)) = (last, at) {
+                    let gap = b.duration_since(a);
+                    if gap > max_gap {
+                        max_gap = gap;
+                        println!("new max gap {gap:?} after {pushes} pushes");
+                    }
+                }
+                pushes += 1;
+                last = at;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        println!("{pushes} pushes, max gap {max_gap:?}, log {:?}", feed.data.lock().unwrap().pending_log);
+    }
+
+    /// Diagnostic: watches the feed, with ETH's book subscribed as Zorro
+    /// would, for `HL_WATCH_MINUTES` (default 20) and prints every silence
+    /// longer than ten seconds, to see how often testnet goes quiet.
+    #[test]
+    #[ignore]
+    fn watches_for_silent_gaps() {
+        let minutes: u64 = std::env::var("HL_WATCH_MINUTES").ok().and_then(|m| m.parse().ok()).unwrap_or(20);
+        super::start(hyperliquid_rust_sdk::BaseUrl::Testnet).expect("feed");
+        super::book("ETH");
+        let feed = super::current().unwrap();
+        let begun = std::time::Instant::now();
+        let mut last = None;
+        let mut pushes = 0u64;
+        let mut gaps = 0;
+        while begun.elapsed() < std::time::Duration::from_secs(minutes * 60) {
+            let at = feed.data.lock().unwrap().last_push;
+            if at != last {
+                if let (Some(a), Some(b)) = (last, at) {
+                    let gap = b.duration_since(a);
+                    if gap > std::time::Duration::from_secs(10) {
+                        gaps += 1;
+                        println!("at {:?}: silent for {gap:?}", a.duration_since(begun));
+                    }
+                }
+                pushes += 1;
+                last = at;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        println!("{pushes} pushes in {minutes} min, {gaps} silences over 10s, last push {:?} ago, log {:?}",
+            last.map(|a: std::time::Instant| a.elapsed()), feed.data.lock().unwrap().pending_log);
     }
 }

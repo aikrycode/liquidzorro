@@ -83,7 +83,8 @@ static CALLBACKS: OnceLock<Callbacks> = OnceLock::new();
 static PLUGIN: RwLock<Option<&'static PluginState>> = RwLock::new(None);
 // Zorro wants a 6-digit-minimum trade id.
 static NEXT_TRADE_ID: AtomicI32 = AtomicI32::new(100_000);
-// Last SET_ORDERTYPE from Zorro: 0 = FOK, 1 = IOC, 2 = GTC. Defaults to IOC
+// Last SET_ORDERTYPE from Zorro: 0 = FOK, 1 = IOC, 2 = GTC, 4 = post-only
+// GTC (plugin-specific, see bridge::ORDER_TYPE_POST_ONLY). Defaults to IOC
 // so an order placed before Zorro sets one still behaves as a market order.
 static ORDER_TYPE: AtomicI32 = AtomicI32::new(1);
 
@@ -183,6 +184,17 @@ pub fn register_trade(coin: &str, oid: u64, is_buy: bool, entry_price: f64, entr
         );
     }
     id
+}
+
+/// Points a trade at its order as it now stands after a modify: possibly a
+/// new order id, a new limit price and a new size, nothing filled yet.
+pub fn set_resting(zorro_id: i32, oid: u64, price: f64, sz: f64) {
+    with_trade(zorro_id, |info| {
+        info.oid = oid;
+        info.entry_price = price;
+        info.entry_sz = sz;
+        info.remaining_sz = sz;
+    });
 }
 
 /// Records the exchange order id of the stop now resting for this trade.

@@ -8,7 +8,7 @@ use std::env;
 
 use alloy::signers::local::PrivateKeySigner;
 use hyperliquid_rust_sdk::{
-    BaseUrl, CandlesSnapshotResponse, ClientCancelRequest, ClientLimit, ClientOrder,
+    BaseUrl, CandlesSnapshotResponse, ClientCancelRequest, ClientLimit, ClientModifyRequest, ClientOrder,
     ClientOrderRequest, ClientTrigger, ExchangeClient, ExchangeDataStatus,
     ExchangeResponseStatus, InfoClient,
 };
@@ -65,6 +65,55 @@ pub const AMOUNT_SCALE: f64 = 100_000.0;
 
 /// Zorro's SET_ORDERTYPE value for a good-till-cancelled (resting) order.
 pub const ORDER_TYPE_GTC: i32 = 2;
+
+/// Plugin-specific SET_ORDERTYPE value: good-till-cancelled and post-only,
+/// Hyperliquid's "Alo" (add liquidity only). Zorro defines only 0-2; 4
+/// keeps clear of the flag bits some plugins add to those.
+pub const ORDER_TYPE_POST_ONLY: i32 = 4;
+
+/// Hyperliquid time-in-force for an order under `order_type`.
+///
+/// Hyperliquid has no fill-or-kill, so FOK degrades to IOC: immediate like
+/// FOK, but it may fill partially instead of killing. A market order is
+/// always IOC, except post-only: an order that may only rest needs a price
+/// to rest at, and quietly sending IOC would take liquidity, the one thing
+/// post-only was asked never to do.
+fn time_in_force(order_type: i32, has_limit: bool) -> Result<&'static str, String> {
+    match (order_type, has_limit) {
+        (ORDER_TYPE_POST_ONLY, false) => {
+            Err("a post-only order needs a limit price; it cannot be sent at market".to_string())
+        }
+        (ORDER_TYPE_POST_ONLY, true) => Ok("Alo"),
+        (ORDER_TYPE_GTC, true) => Ok("Gtc"),
+        _ => Ok("Ioc"),
+    }
+}
+
+#[cfg(test)]
+mod tif_tests {
+    use super::*;
+
+    #[test]
+    fn market_orders_are_ioc() {
+        for order_type in [0, 1, ORDER_TYPE_GTC] {
+            assert_eq!(time_in_force(order_type, false), Ok("Ioc"));
+        }
+    }
+
+    #[test]
+    fn limit_orders_follow_the_order_type() {
+        assert_eq!(time_in_force(0, true), Ok("Ioc"), "no FOK on Hyperliquid");
+        assert_eq!(time_in_force(1, true), Ok("Ioc"));
+        assert_eq!(time_in_force(ORDER_TYPE_GTC, true), Ok("Gtc"));
+        assert_eq!(time_in_force(ORDER_TYPE_POST_ONLY, true), Ok("Alo"));
+    }
+
+    /// Sent as IOC, it would cross the book and pay the taker fee.
+    #[test]
+    fn a_post_only_market_order_is_refused() {
+        assert!(time_in_force(ORDER_TYPE_POST_ONLY, false).is_err());
+    }
+}
 
 /// Market order if `limit == 0.0`, else a limit order that rests (GTC) or
 /// fills immediately depending on Zorro's SET_ORDERTYPE. Positive `amount`
@@ -131,17 +180,19 @@ pub fn place_order(
 
         // SDK's market_open() only checks the perp universe for price, 404s
         // on spot pairs -- build the order ourselves so one path serves both.
-        let (limit_px, tif) = if limit > 0.0 {
-            // Hyperliquid has no fill-or-kill TIF, so FOK degrades to IOC --
-            // immediate like FOK, but may fill partially instead of killing.
-            let tif = if state::order_type() == ORDER_TYPE_GTC { "Gtc" } else { "Ioc" };
+        // A close is never post-only: it has to happen, and one refused for
+        // crossing the book would leave the position open. It keeps the
+        // rest of the setting, so a limit close still rests.
+        let order_type = match state::order_type() {
+            ORDER_TYPE_POST_ONLY if closing => ORDER_TYPE_GTC,
+            other => other,
+        };
+        let tif = time_in_force(order_type, limit > 0.0)?;
+        let limit_px = if limit > 0.0 {
             // An unrounded price straight from Zorro is rejected as invalid.
-            (assets::round_price(limit, &asset), tif)
+            assets::round_price(limit, &asset)
         } else {
-            (
-                marketable_price(&plugin.info_client, symbol, &asset, is_buy, 0.05).await?,
-                "Ioc",
-            )
+            marketable_price(&plugin.info_client, symbol, &asset, is_buy, 0.05).await?
         };
 
         let order = ClientOrderRequest {
@@ -218,8 +269,184 @@ pub fn place_order(
             let zorro_id = state::register_trade(symbol, order.oid, is_buy, limit_px, sz);
             Ok((zorro_id, limit_px, 0))
         }
+        // Post-only refusals read "Post only order would have immediately
+        // matched"; name the cause so the log says what to change.
+        ExchangeDataStatus::Error(e) if e.to_lowercase().contains("post only") => {
+            Err(format!("post-only order refused, it would have crossed the book: {e}"))
+        }
         ExchangeDataStatus::Error(e) => Err(format!("order error: {e}")),
         other => Err(format!("unexpected order status: {other:?}")),
+    }
+}
+
+/// Moves a resting order to `new_limit`, and to `new_amount` lots if that is
+/// above zero, in one step. Backs the plugin's `DO_MODIFY` command.
+///
+/// One modify instead of cancel-and-replace: there is no moment with no
+/// order on the book, and it is one signed request instead of two. Only an
+/// order with nothing filled can be modified. A partial fill has already
+/// become a position, and resizing what is left of it would leave the
+/// trade's size meaning two different things.
+///
+/// Returns lots filled by the modify itself: 0 while the order rests, more
+/// if the new price crossed the book and it filled on the spot.
+pub fn modify_order(zorro_id: i32, new_limit: f64, new_amount: i32) -> Result<i32, String> {
+    let plugin = state::get().ok_or("not logged in")?;
+    let info = state::get_trade(zorro_id).ok_or("unknown trade id")?;
+    if info.closed {
+        return Err("the trade is closed".to_string());
+    }
+    if new_limit <= 0.0 {
+        return Err("a modify needs a limit price".to_string());
+    }
+
+    let (sz, limit_px, response) = runtime::get().block_on(async {
+        // An order placed a moment ago can be accepted before the order
+        // lookup has indexed it, and then reads as unknown; give it a second.
+        let mut order = None;
+        for attempt in 0..5 {
+            if attempt > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+            let status = plugin
+                .info_client
+                .query_order_by_oid(plugin.address, info.oid)
+                .await
+                .map_err(|e| format!("order lookup failed: {e}"))?;
+            if status.order.is_some() {
+                order = status.order;
+                break;
+            }
+        }
+        let order = order.ok_or("the exchange no longer knows this order")?;
+        if order.status != "open" {
+            return Err(format!("the order is {}, nothing to modify", order.status));
+        }
+        if order.order.sz != order.order.orig_sz {
+            return Err(format!(
+                "{} of {} has filled; cancel and place a new order instead",
+                order.order.orig_sz.parse::<f64>().unwrap_or(0.0)
+                    - order.order.sz.parse::<f64>().unwrap_or(0.0),
+                order.order.orig_sz
+            ));
+        }
+
+        let asset = resolve_asset(&plugin.info_client, &info.coin).await?;
+        let sz = if new_amount > 0 {
+            assets::round_size(new_amount as f64 / AMOUNT_SCALE, asset.sz_decimals)
+        } else {
+            info.entry_sz
+        };
+        if sz <= 0.0 {
+            return Err(format!("{new_amount} lots rounds to zero size"));
+        }
+        let limit_px = assets::round_price(new_limit, &asset);
+        // Keeps what the order was: a post-only order stays post-only, and
+        // a reduce-only close stays reduce-only.
+        let tif = order.order.tif.clone().unwrap_or_else(|| "Gtc".to_string());
+        // Hyperliquid carries out a modify by cancelling the order and then
+        // placing the new one, so a refused replacement leaves no order at
+        // all. Refuse a post-only move through the book here, while the
+        // original is still safely resting.
+        if tif == "Alo" {
+            if let Some(opposite) = best_offer(&plugin.info_client, &info.coin, info.is_buy).await {
+                if would_cross(info.is_buy, limit_px, opposite) {
+                    return Err(format!(
+                        "post-only order cannot move to {limit_px}: the best {} is {opposite}, so it would cross the book; the order still rests where it was",
+                        if info.is_buy { "ask" } else { "bid" }
+                    ));
+                }
+            }
+        }
+        let request = ClientModifyRequest {
+            oid: info.oid,
+            order: ClientOrderRequest {
+                asset: info.coin.clone(),
+                is_buy: info.is_buy,
+                reduce_only: order.order.reduce_only,
+                limit_px,
+                sz,
+                cloid: None,
+                order_type: ClientOrder::Limit(ClientLimit { tif }),
+            },
+        };
+        let response = plugin
+            .exchange_client
+            .modify(request, None)
+            .await
+            .map_err(|e| format!("modify request failed: {e}"))?;
+        Ok::<_, String>((sz, limit_px, response))
+    })?;
+
+    let status = match response {
+        ExchangeResponseStatus::Err(e) => return Err(format!("modify rejected: {e}")),
+        ExchangeResponseStatus::Ok(r) => r
+            .data
+            .and_then(|d| d.statuses.into_iter().next())
+            .ok_or("exchange response carried no order status")?,
+    };
+    // A modify can hand the order a new id; follow it, or BrokerTrade
+    // would go on polling an order that no longer exists.
+    match status {
+        ExchangeDataStatus::Resting(order) => {
+            state::set_resting(zorro_id, order.oid, limit_px, sz);
+            Ok(0)
+        }
+        ExchangeDataStatus::Filled(order) => {
+            let price = order.avg_px.parse().unwrap_or(limit_px);
+            state::set_resting(zorro_id, order.oid, price, sz);
+            Ok((sz * AMOUNT_SCALE).round() as i32)
+        }
+        // The original was cancelled before the replacement was refused.
+        // Say so: a script that believes it still has an order working
+        // will wait for a fill that cannot come. BrokerTrade reports the
+        // order as cancelled, so Zorro's own book catches up as well.
+        ExchangeDataStatus::Error(e) => Err(format!(
+            "modify refused ({e}); {}",
+            if order_still_open(info.oid) {
+                "the original order still rests"
+            } else {
+                "the exchange cancelled the original order, so nothing rests now"
+            }
+        )),
+        other => Err(format!("unexpected modify status: {other:?}")),
+    }
+}
+
+/// Whether a limit at `limit` would trade against the best opposite price:
+/// a buy at or above the ask, a sell at or below the bid.
+fn would_cross(is_buy: bool, limit: f64, opposite: f64) -> bool {
+    if is_buy {
+        limit >= opposite
+    } else {
+        limit <= opposite
+    }
+}
+
+fn order_still_open(oid: u64) -> bool {
+    let Some(plugin) = state::get() else { return false };
+    matches!(
+        runtime::get().block_on(plugin.info_client.query_order_by_oid(plugin.address, oid)),
+        Ok(status) if status.order.as_ref().is_some_and(|o| o.status == "open")
+    )
+}
+
+#[cfg(test)]
+mod cross_tests {
+    use super::would_cross;
+
+    #[test]
+    fn a_buy_crosses_at_or_above_the_ask() {
+        assert!(would_cross(true, 2245.8, 2245.8));
+        assert!(would_cross(true, 2300.0, 2245.8));
+        assert!(!would_cross(true, 2245.7, 2245.8));
+    }
+
+    #[test]
+    fn a_sell_crosses_at_or_below_the_bid() {
+        assert!(would_cross(false, 2245.5, 2245.5));
+        assert!(would_cross(false, 2200.0, 2245.5));
+        assert!(!would_cross(false, 2245.6, 2245.5));
     }
 }
 

@@ -125,7 +125,7 @@ What it covers:
 - A resting limit order placed below market, then cancelled.
 - An order under the exchange's $10 minimum, to confirm it is refused cleanly.
 
-It trades IBTC/USDC (`@460`), a testnet pair with a ~0.3% spread and 0.01-coin size steps, holds at most ~$75 at once, and loses only spread and fees -- well under a dollar a run. Edit `MIN_BALANCE` (default 750) to set the floor it refuses to trade below, and `CYCLES` to change how many round trips it makes.
+It trades FTEST/USDC (`@171`), a testnet pair with a ~0.3% spread and 0.01-coin size steps, holds at most ~$75 at once, and loses only spread and fees -- well under a dollar a run. Edit `MIN_BALANCE` (default 750) to set the floor it refuses to trade below, and `CYCLES` to change how many round trips it makes.
 
 ## Support
 

@@ -13,16 +13,18 @@
 // spread and fees (well under a dollar across a full run). Aborts
 // immediately if the account balance would drop under MIN_BALANCE.
 //
-// Traded on IBTC/USDC ("@460"), which a testnet market maker quotes at ~0.3%
-// with thousands of dollars on each side, in 0.01-coin size steps worth
-// ~$0.001. The step size decides the cost: a spot buy pays its fee in the
-// coin, so every round trip leaves a fraction of a step that can never be
-// sold, and Hyperliquid sweeps it from the wallet within minutes. On
-// PURR/USDC, whose step is one whole coin, that was a whole coin per cycle.
+// Traded on FTEST/USDC ("@171"), which a testnet market maker quotes at
+// ~0.3% with ~$25,000 on each side, steady at ~$1.02, in 0.01-coin size
+// steps worth ~$0.01. The step size decides the cost: a spot buy pays its
+// fee in the coin, so every round trip leaves a fraction of a step that
+// can never be sold, and Hyperliquid sweeps it from the wallet within
+// minutes. On PURR/USDC, whose step is one whole coin, that was a whole coin per
+// cycle. The price matters too: Zorro's order size is an int, and at
+// 100000 lots a coin, $60 of a $0.002 coin overflows it.
 // HYPE/USDC ("@1035") is unusable: it quotes a ~22% spread and ran from
 // $188 to $5480 inside two hours.
 
-#define HL_SYMBOL       "IBTC/USDC"  // exchange symbol "@460", via the asset list
+#define HL_SYMBOL       "FTEST/USDC" // exchange symbol "@171", via the asset list
 #define ALT_SYMBOL      "BTC/USD"    // priced only -- too coarse to trade at this size
 #define MIN_BALANCE     750          // hard floor; abort rather than spend past this
 // Per cycle, split in three. Every chunk must clear the exchange's $10
@@ -35,7 +37,7 @@
 #define HISTORY_BARS    50           // candles to pull via BrokerHistory2
 
 #define AMOUNT_SCALE    100000.
-// One exchange size step for HL_SYMBOL: IBTC has szDecimals 2, so it
+// One exchange size step for HL_SYMBOL: FTEST has szDecimals 2, so it
 // trades in 0.01 coins, which is 1000 lots. Less than this cannot be sold
 // at all, so it is the floor a close can reach, not a tolerance.
 #define DUST_THRESHOLD_LOTS 1000.
