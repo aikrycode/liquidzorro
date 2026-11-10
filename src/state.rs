@@ -43,6 +43,9 @@ pub struct TradeInfo {
     /// Held so closing the trade can cancel it: a stop left behind would
     /// still be live against whatever position comes next.
     pub stop_oid: Option<u64>,
+    /// True while the order was last seen resting unfilled. Lets an order
+    /// the exchange briefly calls unknown keep its last known state.
+    pub pending: bool,
 }
 
 impl TradeInfo {
@@ -180,6 +183,7 @@ pub fn register_trade(coin: &str, oid: u64, is_buy: bool, entry_price: f64, entr
                 entry_fee_final: false,
                 close_fees: 0.0,
                 stop_oid: None,
+                pending: false,
             },
         );
     }
@@ -194,7 +198,13 @@ pub fn set_resting(zorro_id: i32, oid: u64, price: f64, sz: f64) {
         info.entry_price = price;
         info.entry_sz = sz;
         info.remaining_sz = sz;
+        info.pending = true;
     });
+}
+
+/// Records whether a trade's order rests unfilled on the exchange.
+pub fn set_pending(zorro_id: i32, pending: bool) {
+    with_trade(zorro_id, |info| info.pending = pending);
 }
 
 /// Records the exchange order id of the stop now resting for this trade.

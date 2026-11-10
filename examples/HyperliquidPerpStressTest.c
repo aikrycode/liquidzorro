@@ -272,6 +272,11 @@ function run()
 			MarginVal - MarginFlat, Expected, MAX_LEVERAGE);
 		check("Margin used matches the notional at this leverage",
 			abs(MarginVal - MarginFlat - Expected) < Expected*0.25);
+		// Opening a position spends only a fee. On a unified account the
+		// margin also shows as a spot "hold", and counting both once made
+		// the balance jump by the whole margin.
+		printf("\nBalance while long: %.2f (started %.2f)", Balance, StartBalance);
+		check("An open position does not inflate the balance", abs(Balance - StartBalance) < 1);
 		Phase = PH_CLOSE_LONG;
 		return;
 	}

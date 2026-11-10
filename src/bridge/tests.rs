@@ -297,6 +297,58 @@ fn spot_decimals_for(_spot: &crate::assets::AssetInfo, sz_decimals: u32) -> u32 
 /// A short is the thing spot could never express. Opens one, checks the
 /// position reports **negative**, then closes it with `closing = true` so
 /// the order is reduce-only and cannot overshoot into a long.
+/// Prints the raw balances behind `account_balance`: spot USDC total and
+/// hold, perp account value and unrealized P&L.
+fn raw_balances(plugin: &state::PluginState, when: &str) {
+    let (perp, spot) = runtime::get().block_on(async {
+        (
+            plugin.info_client.user_state(plugin.address).await.unwrap(),
+            plugin.info_client.user_token_balances(plugin.address).await.unwrap(),
+        )
+    });
+    let usdc = spot.balances.iter().find(|b| b.coin == "USDC");
+    let upnl: f64 = perp.asset_positions.iter()
+        .filter_map(|p| p.position.unrealized_pnl.parse::<f64>().ok()).sum();
+    println!(
+        "{when}: spot USDC total {:?} hold {:?}; perp account value {} margin {} upnl {upnl}; plugin says {:?}",
+        usdc.map(|b| &b.total), usdc.map(|b| &b.hold),
+        perp.margin_summary.account_value, perp.margin_summary.total_margin_used,
+        account_balance(),
+    );
+}
+
+/// Equity must not jump when a perp opens: on a unified account the perp
+/// margin is already inside spot USDC (as hold), so adding the perp
+/// account value on top counted it twice.
+#[test]
+#[ignore]
+fn equity_is_counted_once_while_a_perp_is_open() {
+    login(None, BaseUrl::Testnet).expect("login should succeed");
+    let plugin = state::get().unwrap();
+    set_leverage(TEST_PERP, 1).expect("1x leverage");
+    state::set_order_type(1); // IOC
+    let equity = || account_balance().map(|(balance, trade_val, _)| balance + trade_val).unwrap();
+
+    raw_balances(plugin, "flat");
+    let before = equity();
+    let price = asset_price(TEST_PERP).expect("price");
+    let units = (minimum_qty(price) * AMOUNT_SCALE).round() as i32;
+    let (id, _, fill) = place_order(TEST_PERP, units, 0.0, false, 0.0).expect("long should open");
+    assert!(fill > 0, "expected the long to fill");
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    raw_balances(plugin, "long open");
+    let during = equity();
+    close_trade(id, fill, 0.0).expect("long should close");
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    raw_balances(plugin, "closed");
+    let after = equity();
+    println!("equity {before} -> {during} -> {after}");
+    // A $10 round trip moves equity by cents; a double count moves it by
+    // the whole margin.
+    assert!((during - before).abs() < 1.0, "equity jumped while open: {before} -> {during}");
+    assert!((after - before).abs() < 1.0, "equity jumped after closing: {before} -> {after}");
+}
+
 #[test]
 #[ignore]
 fn opens_and_closes_a_perp_short() {

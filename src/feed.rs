@@ -58,6 +58,10 @@ struct Data {
     mids: HashMap<String, f64>,
     /// When the last push of any kind arrived; `None` while disconnected.
     last_push: Option<Instant>,
+    /// When the connection last dropped. The SDK reconnects by itself
+    /// within seconds, so a drop starts the restart clock rather than
+    /// counting as already overdue.
+    dropped_at: Option<Instant>,
     books: HashMap<String, Book>,
     /// Assets with a book subscription, kept across reconnects because the
     /// SDK resubscribes them itself.
@@ -141,13 +145,17 @@ fn current() -> Option<Arc<Feed>> {
 /// the books it carried. Call from Zorro's thread; cheap when all is well.
 pub fn maintain() {
     let Some(feed) = current() else { return };
-    let (stuck, books) = {
-        let data = feed.data.lock().unwrap_or_else(|e| e.into_inner());
-        let last_sign_of_life = data.last_push.unwrap_or(feed.started_at);
-        (last_sign_of_life.elapsed() > RESTART_AFTER, data.subscribed.clone())
+    let (books, earlier_log) = {
+        let mut data = feed.data.lock().unwrap_or_else(|e| e.into_inner());
+        if !needs_restart(&data, feed.started_at, Instant::now()) {
+            return;
+        }
+        // Kept so the old feed's last words, such as why it dropped, still
+        // reach Zorro's log.
+        (data.subscribed.clone(), std::mem::take(&mut data.pending_log))
     };
-    if !stuck {
-        return;
+    for line in &earlier_log {
+        crate::state::log_message(line);
     }
     let base_url = feed.base_url;
     drop(feed);
@@ -196,6 +204,7 @@ fn apply(data: &mut Data, message: Message, now: Instant) {
             data.mids.clear();
             data.books.clear();
             data.last_push = None;
+            data.dropped_at = Some(now);
             data.log("Hyperliquid: live feed dropped, reconnecting".to_string());
         }
         Message::HyperliquidError(e) => {
@@ -213,6 +222,13 @@ fn book_from_levels(levels: &[Option<BookLevel>]) -> Option<Book> {
     };
     let (bid, ask) = (side(0)?, side(1)?);
     (ask >= bid).then_some(Book { bid, ask })
+}
+
+/// Whether the feed has been silent for `RESTART_AFTER`, counted from its
+/// last push, else its last drop, else its start.
+fn needs_restart(data: &Data, started_at: Instant, now: Instant) -> bool {
+    let since = data.last_push.or(data.dropped_at).unwrap_or(started_at);
+    now.duration_since(since) > RESTART_AFTER
 }
 
 fn is_live(data: &Data, now: Instant) -> bool {
@@ -333,6 +349,31 @@ mod tests {
         assert!(!is_live(&data, now));
         assert!(data.subscribed.contains("ETH"), "the SDK resubscribes, so keep the record");
         assert_eq!(data.pending_log.len(), 1);
+    }
+
+    /// A drop gives the SDK's own reconnect time to work. Clearing the last
+    /// push used to make a feed opened long ago look silent since its start,
+    /// so every brief drop forced a restart at the next poll.
+    #[test]
+    fn a_drop_starts_the_restart_clock() {
+        let opened = Instant::now();
+        let dropped = opened + Duration::from_secs(600);
+        let mut data = Data::default();
+        data.last_push = Some(dropped - Duration::from_secs(1));
+        apply(&mut data, Message::NoData, dropped);
+        assert!(!needs_restart(&data, opened, dropped + Duration::from_secs(5)));
+        assert!(!needs_restart(&data, opened, dropped + RESTART_AFTER));
+        assert!(needs_restart(&data, opened, dropped + RESTART_AFTER + Duration::from_millis(1)));
+    }
+
+    #[test]
+    fn a_silent_feed_is_restarted_from_its_last_push() {
+        let opened = Instant::now();
+        let mut data = Data::default();
+        assert!(!needs_restart(&data, opened, opened + RESTART_AFTER));
+        assert!(needs_restart(&data, opened, opened + RESTART_AFTER + Duration::from_millis(1)));
+        data.last_push = Some(opened + Duration::from_secs(300));
+        assert!(!needs_restart(&data, opened, opened + Duration::from_secs(300) + RESTART_AFTER));
     }
 
     /// A book push alone keeps the feed alive: testnet all-mids pushes can

@@ -267,6 +267,7 @@ pub fn place_order(
         // trade and polls BrokerTrade until it fills or it cancels it.
         ExchangeDataStatus::Resting(order) => {
             let zorro_id = state::register_trade(symbol, order.oid, is_buy, limit_px, sz);
+            state::set_pending(zorro_id, true);
             Ok((zorro_id, limit_px, 0))
         }
         // Post-only refusals read "Post only order would have immediately
@@ -1021,14 +1022,20 @@ pub fn trade_status(zorro_id: i32) -> Option<(f64, f64, f64, f64, i32)> {
     // filled_sz drives profit: an order still resting has none, so it must
     // not accrue P&L just because the market moved away from its limit.
     let (fill_state, filled_sz) = match status.order {
-        None => (-1, info.entry_sz), // no longer tracked -> treat as closed
+        // Testnet calls a just-placed order unknown for a moment, and an
+        // order the exchange accepted is never forgotten: report the last
+        // known state and ask again on the next poll. Reading unknown as
+        // closed made Zorro drop a freshly resting limit order.
+        None => last_known_fill(&info),
         Some(order_info) => match order_info.status.as_str() {
             // Report what is still open, not the original fill: partial
             // closes shrink the trade and Zorro tracks it by this number.
-            "filled" => (
-                (info.remaining_sz * AMOUNT_SCALE).round() as i32,
-                info.remaining_sz,
-            ),
+            "filled" => {
+                if info.pending {
+                    state::set_pending(zorro_id, false);
+                }
+                last_known_fill(&state::TradeInfo { pending: false, ..info.clone() })
+            }
             "canceled" | "rejected" | "marginCanceled" => (NAY - 1, 0.0),
             _ => {
                 let remaining: f64 = order_info.order.sz.parse().unwrap_or(info.entry_sz);
@@ -1053,14 +1060,130 @@ pub fn trade_status(zorro_id: i32) -> Option<(f64, f64, f64, f64, i32)> {
     Some((info.entry_price, close_price, cost, profit, fill_state))
 }
 
-/// `(balance, trade_val, margin_val)` for `BrokerAccount`.
+/// `(fill_state, filled_sz)` from what the plugin last knew of a trade:
+/// nothing filled while it rests, else the size still open.
+fn last_known_fill(info: &state::TradeInfo) -> (i32, f64) {
+    if info.pending {
+        (0, 0.0)
+    } else {
+        ((info.remaining_sz * AMOUNT_SCALE).round() as i32, info.remaining_sz)
+    }
+}
+
+#[cfg(test)]
+mod unknown_order_tests {
+    use super::*;
+
+    fn trade(pending: bool) -> state::TradeInfo {
+        state::TradeInfo {
+            coin: "ETH".into(),
+            oid: 1,
+            is_buy: true,
+            entry_price: 1264.0,
+            entry_sz: 0.0119,
+            remaining_sz: 0.0119,
+            closed: false,
+            entry_fee: 0.0,
+            entry_fee_final: false,
+            close_fees: 0.0,
+            stop_oid: None,
+            pending,
+        }
+    }
+
+    /// A resting order the exchange has not indexed yet stays pending.
+    #[test]
+    fn an_unknown_resting_order_stays_pending() {
+        assert_eq!(last_known_fill(&trade(true)), (0, 0.0));
+    }
+
+    /// A filled trade keeps reporting its open size, never -1 (closed).
+    #[test]
+    fn an_unknown_filled_trade_stays_open() {
+        assert_eq!(last_known_fill(&trade(false)), (1190, 0.0119));
+    }
+}
+
+/// Whether the account runs in a mode where spot USDC backs the perps
+/// (`unifiedAccount`, `portfolioMargin`). Asked once per address: the mode
+/// rarely changes, and BrokerAccount is polled constantly. A failed query
+/// is not remembered, so it is asked again next time.
+fn is_unified(plugin: &state::PluginState) -> bool {
+    static MODE: std::sync::Mutex<Option<(String, bool)>> = std::sync::Mutex::new(None);
+    let address = format!("{:#x}", plugin.address);
+    if let Some((known, unified)) = MODE.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        if *known == address {
+            return *unified;
+        }
+    }
+    let body = format!(r#"{{"type":"userAbstraction","user":"{address}"}}"#);
+    let Ok(reply) = runtime::get().block_on(plugin.info_client.http_client.post("/info", body)) else {
+        return false;
+    };
+    let unified = unified_mode(&reply);
+    *MODE.lock().unwrap_or_else(|e| e.into_inner()) = Some((address, unified));
+    unified
+}
+
+/// Reads a `userAbstraction` reply, a bare JSON string such as
+/// `"unifiedAccount"`.
+fn unified_mode(reply: &str) -> bool {
+    matches!(reply.trim().trim_matches('"'), "unifiedAccount" | "portfolioMargin")
+}
+
+/// `(balance, trade_val)` from the raw figures. Zorro's balance is cash and
+/// trade value is open P&L, so equity is their sum.
 ///
-/// The perp account is the meaningful one once positions exist: account
-/// value already includes unrealized P&L, and margin in use is what limits
-/// further trading. Spot USDC sitting outside the perp wallet is added on
-/// so a spot-only account still reports a balance.
+/// - Unified: one USDC balance, shown in spot, backs everything. The perp
+///   account value is a slice of it (spot "hold") plus open P&L, so adding
+///   it to spot counted the margin twice: measured on testnet, the
+///   balance read high by the margin held, and higher still with a
+///   position open.
+/// - Classic: spot and perp are separate wallets. Perp account value
+///   includes open P&L, so only its cash part goes into the balance.
+fn combine_balances(unified: bool, spot_usdc: f64, perp_value: f64, unrealized: f64) -> (f64, f64) {
+    if unified {
+        (spot_usdc, unrealized)
+    } else {
+        (spot_usdc + perp_value - unrealized, unrealized)
+    }
+}
+
+#[cfg(test)]
+mod balance_tests {
+    use super::*;
+
+    /// Spot cash with a perp open: the perp account value is not added.
+    #[test]
+    fn a_unified_account_counts_its_margin_once() {
+        let (balance, trade_val) = combine_balances(true, 1000.0, 30.0, 0.5);
+        assert_eq!(balance, 1000.0);
+        assert_eq!(trade_val, 0.5);
+    }
+
+    #[test]
+    fn a_classic_account_adds_its_perp_cash() {
+        let (balance, trade_val) = combine_balances(false, 100.0, 50.5, 0.5);
+        assert!((balance - 150.0).abs() < 1e-9, "open P&L is trade value, not cash: {balance}");
+        assert_eq!(trade_val, 0.5);
+    }
+
+    #[test]
+    fn reads_the_abstraction_reply() {
+        assert!(unified_mode("\"unifiedAccount\""));
+        assert!(unified_mode("\"portfolioMargin\"\n"));
+        assert!(!unified_mode("\"disabled\""));
+        assert!(!unified_mode("\"dexAbstraction\""));
+        assert!(!unified_mode("null"));
+    }
+}
+
+/// `(balance, trade_val, margin_val)` for `BrokerAccount`: cash, open P&L,
+/// and margin in use, which is what limits further trading. How spot and
+/// perp figures combine depends on the account mode; see `combine_balances`.
 pub fn account_balance() -> Option<(f64, f64, f64)> {
     let plugin = state::get()?;
+    let unified = is_unified(plugin);
     let (state_resp, token_resp) = runtime::get().block_on(async {
         let a = plugin.info_client.user_state(plugin.address).await;
         let b = plugin.info_client.user_token_balances(plugin.address).await;
@@ -1093,7 +1216,8 @@ pub fn account_balance() -> Option<(f64, f64, f64)> {
         .filter_map(|p| p.position.unrealized_pnl.parse::<f64>().ok())
         .sum();
 
-    Some((account_value + spot_usdc, unrealized, margin_used))
+    let (balance, trade_val) = combine_balances(unified, spot_usdc, account_value, unrealized);
+    Some((balance, trade_val, margin_used))
 }
 
 /// Net position for `symbol`, read from Hyperliquid rather than Zorro's
