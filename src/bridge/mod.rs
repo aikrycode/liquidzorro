@@ -143,6 +143,15 @@ pub fn place_order(
     let is_buy = amount > 0;
     let raw_sz = amount.unsigned_abs() as f64 / AMOUNT_SCALE;
 
+    // Closes never go out as a TWAP: they fall through and fill now.
+    if twap::minutes() > 0 && !closing {
+        if stop_dist > 0.0 {
+            return Err("a TWAP entry cannot carry a stop: it fills over minutes, and a stop \
+needs the filled size; place the stop once the TWAP is done".to_string());
+        }
+        return twap::place(symbol, is_buy, raw_sz);
+    }
+
     let (sz, limit_px, is_perp, response) = runtime::get().block_on(async {
         // Rounding rules depend on which universe the symbol lives in --
         // notably prices, where perps allow fewer decimals than spot.
@@ -518,6 +527,9 @@ async fn mid_price(info: &InfoClient, symbol: &str) -> Result<f64, String> {
 /// Cancels a resting order by its Zorro trade id. Backs DO_CANCEL.
 pub fn cancel_order(zorro_id: i32) -> Result<(), String> {
     let info = state::get_trade(zorro_id).ok_or_else(|| format!("unknown trade id {zorro_id}"))?;
+    if info.twap_id.is_some() {
+        return twap::stop(zorro_id, &info);
+    }
 
     cancel_stop(&info.coin, zorro_id);
     cancel_oid(&info.coin, info.oid)
@@ -667,9 +679,22 @@ pub struct CloseOutcome {
 /// own order, and its fee would otherwise be stranded on a bookkeeping
 /// entry Zorro never sees.
 pub fn close_trade(trade_id: i32, amount: i32, limit: f64) -> Result<CloseOutcome, String> {
-    let info = state::get_trade(trade_id).ok_or("unknown trade id")?;
+    let mut info = state::get_trade(trade_id).ok_or("unknown trade id")?;
     if amount == 0 {
         return Err("nothing to close".to_string());
+    }
+    // A TWAP still slicing would keep adding to the position being closed,
+    // so stop it first. Zorro asks for the size it last saw, and a slice
+    // can fill between its poll and the stop: close everything that filled,
+    // or that slice is left open with no trade to close it.
+    let mut amount = amount;
+    if info.twap_running {
+        twap::stop(trade_id, &info)?;
+        info = state::get_trade(trade_id).ok_or("unknown trade id")?;
+        if info.remaining_sz <= 0.0 {
+            return Err("the TWAP filled nothing; it is stopped and there is nothing to close".to_string());
+        }
+        amount = amount.signum() * (info.remaining_sz * AMOUNT_SCALE).round() as i32;
     }
     let symbol = info.coin.clone();
     let requested = amount.unsigned_abs() as f64 / AMOUNT_SCALE;
@@ -1004,6 +1029,10 @@ pub fn trade_status(zorro_id: i32) -> Option<(f64, f64, f64, f64, i32)> {
     let plugin = state::get()?;
     let info = state::get_trade(zorro_id)?;
 
+    if info.twap_id.is_some() {
+        return twap::status(zorro_id, &info);
+    }
+
     // -1 = completely closed. Hyperliquid reports a filled order as "filled"
     // forever, so the flag is the only way Zorro learns the trade is gone.
     if info.closed {
@@ -1088,6 +1117,8 @@ mod unknown_order_tests {
             close_fees: 0.0,
             stop_oid: None,
             pending,
+            twap_id: None,
+            twap_running: false,
         }
     }
 
@@ -1643,6 +1674,11 @@ mod history_window_tests {
         assert_eq!(start, 0);
     }
 }
+
+mod twap;
+pub use twap::{minutes as twap_minutes, set_minutes as set_twap_minutes};
+#[cfg(test)]
+use twap::{cancel_by_id as cancel_twap_by_id, running_twaps};
 
 #[cfg(test)]
 mod tests;

@@ -86,6 +86,10 @@ pub unsafe extern "C" fn BrokerLogin(
         // keep talking to the old one.
         if user.is_null() {
             crate::feed::stop();
+            // A TWAP already running keeps slicing on the exchange; only
+            // the switch for new entries is reset, so the next session
+            // starts filling entries at once.
+            bridge::set_twap_minutes(0);
             state::clear();
             state::log_message("Hyperliquid: logged out");
             return 1;
@@ -409,7 +413,8 @@ const GET_BROKERZONE: c_int = 40;
 const GET_MAXTICKS: c_int = 43;
 
 /// SET_ORDERTYPE: 0 = fill-or-kill, 1 = immediate-or-cancel, 2 = GTC, and
-/// plugin-specific 4 = post-only GTC (Hyperliquid "Alo").
+/// plugin-specific 4 = post-only GTC (Hyperliquid "Alo"), Zorro's slot for
+/// a broker-specific type. (Zorro's +8 stop flag is not used.)
 /// Echoing the value back is how a plugin tells Zorro it honours order
 /// types at all -- returning 0 makes Zorro assume limit orders are
 /// unsupported and skip them entirely.
@@ -424,6 +429,12 @@ const DO_CANCEL: c_int = 301;
 /// new size in lots (0 keeps the size). Returns 1 if the order rests at the
 /// new price, 2 if the new price filled it at once, 0 if it was refused.
 const DO_MODIFY: c_int = 2001;
+
+/// SET_TWAP (plugin-specific): enter perps as TWAPs over this many
+/// minutes (5-1440) from now on, or 0 to fill entries at once again (the
+/// default). Closes always fill at once. Returns the minutes set, 0 for
+/// off, or -1 if out of range.
+const SET_TWAP: c_int = 2002;
 
 /// SET_SYMBOL: the asset subsequent commands apply to.
 const SET_SYMBOL: c_int = 132;
@@ -443,6 +454,16 @@ pub unsafe extern "C" fn BrokerCommand(command: c_int, parameter: isize) -> f64 
             state::set_order_type(order_type);
             order_type as f64
         }
+        SET_TWAP => match bridge::set_twap_minutes(parameter as i32) {
+            Some(minutes) => minutes as f64,
+            None => {
+                state::log_message(&format!(
+                    "BrokerCommand(SET_TWAP): {parameter} minutes is outside 5-1440; kept {}",
+                    bridge::twap_minutes()
+                ));
+                -1.0
+            }
+        },
         SET_SYMBOL => match read_cstr(parameter as *const c_char) {
             Some(symbol) => {
                 state::set_symbol(symbol);

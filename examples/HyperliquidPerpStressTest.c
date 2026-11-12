@@ -49,6 +49,11 @@
 #define ORDERTYPE_IOC      1
 // Plugin-specific: GTC that may only add liquidity (Hyperliquid "Alo").
 #define ORDERTYPE_POST_ONLY 4
+// Plugin-specific: enter as a TWAP over this many minutes; 0 = off.
+#define CMD_SET_TWAP       2002
+// The exchange's smallest TWAP is $100. Only the first slices fill before
+// the test closes it, so it costs cents, not the whole $110.
+#define TWAP_USD        110
 
 #define PH_PREFLIGHT    0
 #define PH_LEVERAGE     1
@@ -73,6 +78,11 @@
 #define PH_DONE         19
 #define PH_LIMIT_MODIFY 21
 #define PH_POST_ONLY    22
+#define PH_TWAP_START   23
+#define PH_TWAP_POLL    24
+#define PH_TWAP_CLOSE   25
+#define PH_TWAP_FLAT    26
+#define PH_TWAP_STILL   27
 
 int Phase;
 int Passed, Failed;
@@ -81,6 +91,7 @@ var MarginFlat;
 var PositionBeforeReject;
 int LimitTradeID;
 int LimitPollsLeft;
+int TwapPollsLeft;
 int LimitCancelled;
 int FlattenTriesLeft;
 
@@ -491,6 +502,79 @@ function run()
 		brokerCommand(CMD_SET_ORDERTYPE, ORDERTYPE_IOC);
 		check("A post-only order through the book is refused", Entered == 0);
 		check("The refused post-only order left the position unchanged", isFlat(heldLots() - Before));
+		Phase = PH_TWAP_START;
+		return;
+	}
+
+	///////////////////////////////////////////////////////////////////////
+	// TWAP: the exchange slices one order into small ones every ~30s. To
+	// Zorro it is a trade that starts empty and grows; closing it must stop
+	// the slicing, or the next slice reopens what was just closed.
+	///////////////////////////////////////////////////////////////////////
+	if(Phase == PH_TWAP_START) {
+		var Price = priceClose(0);
+		var Result;
+		if(Price <= 0) return;
+		printf("
+--- TWAP ---");
+		Result = brokerCommand(CMD_SET_TWAP, 4);
+		check("SET_TWAP refuses a length the exchange would refuse", Result == -1);
+		Result = brokerCommand(CMD_SET_TWAP, 5);
+		check("SET_TWAP accepts 5 minutes", Result == 5);
+		Lots = ceil(TWAP_USD/Price*AMOUNT_SCALE);
+		enterLong();
+		// Off at once, so no later entry goes out as a TWAP by accident.
+		brokerCommand(CMD_SET_TWAP, 0);
+		printf("
+TWAP buy submitted: %.0f lots (~$%d) over 5 minutes", Lots, TWAP_USD);
+		TwapPollsLeft = 3;
+		Phase = PH_TWAP_POLL;
+		return;
+	}
+
+	if(Phase == PH_TWAP_POLL) {
+		var ZorroLots = 0, Held = heldLots();
+		int Trades = 0;
+		for(open_trades) { Trades++; ZorroLots += TradeLots; }
+		printf("
+TWAP so far: Zorro %.0f lots in %d trade(s), exchange %.0f lots", ZorroLots, Trades, Held);
+		if(ZorroLots <= 0 && --TwapPollsLeft > 0) return;
+		check("A TWAP entry is one Zorro trade", Trades == 1);
+		check("The TWAP trade grows as its slices fill", ZorroLots > 0);
+		// A slice can land between Zorro's poll and this one, so the
+		// exchange may hold one slice more, never less.
+		check("Zorro's TWAP trade matches what the exchange holds",
+			ZorroLots > 0 && Held >= ZorroLots - dustLots());
+		Phase = PH_TWAP_CLOSE;
+		return;
+	}
+
+	if(Phase == PH_TWAP_CLOSE) {
+		exitLong();
+		printf("
+exitLong submitted; the TWAP should stop with it");
+		Phase = PH_TWAP_FLAT;
+		return;
+	}
+
+	if(Phase == PH_TWAP_FLAT) {
+		var Held = heldLots();
+		printf("
+Position after closing the TWAP trade: %.0f lots", Held);
+		check("Closing a TWAP trade flattens everything it bought", isFlat(Held));
+		Phase = PH_TWAP_STILL;
+		return;
+	}
+
+	// A minute on: two more slices would have landed if it still ran.
+	if(Phase == PH_TWAP_STILL) {
+		var Held = heldLots();
+		int Trades = 0;
+		for(open_trades) if(TradeLots > 0) Trades++;
+		printf("
+Position a minute later: %.0f lots", Held);
+		check("The closed TWAP buys nothing more", isFlat(Held));
+		check("Zorro holds no TWAP trade afterwards", Trades == 0);
 		Phase = PH_REJECT;
 		return;
 	}

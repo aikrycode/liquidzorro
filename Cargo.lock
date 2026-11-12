@@ -2393,6 +2393,9 @@ dependencies = [
  "alloy",
  "hyperliquid_rust_sdk",
  "libloading",
+ "rmp-serde",
+ "serde",
+ "serde_json",
  "tokio",
 ]
 

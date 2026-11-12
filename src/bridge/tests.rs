@@ -818,3 +818,116 @@ fn cancels_leftover_orders() {
         .expect("open orders");
     assert!(left.is_empty(), "still resting: {left:?}");
 }
+
+/// Diagnostic: does testnet accept a scheduled cancel from this account?
+#[test]
+#[ignore]
+fn probes_schedule_cancel() {
+    login(None, BaseUrl::Testnet).expect("login should succeed");
+    let plugin = state::get().unwrap();
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+    let set = runtime::get().block_on(plugin.exchange_client.schedule_cancel(Some(now_ms + 60_000), None));
+    println!("schedule +60s: {set:?}");
+    let clear = runtime::get().block_on(plugin.exchange_client.schedule_cancel(None, None));
+    println!("clear: {clear:?}");
+}
+
+/// A TWAP entry is a Zorro trade that grows as slices fill; closing it
+/// stops the TWAP and closes everything it bought. Costs ~$0.10: $110 is
+/// the smallest TWAP the exchange takes, and only a few slices fill.
+#[test]
+#[ignore]
+fn enters_as_a_twap_and_closes_what_filled() {
+    login(None, BaseUrl::Testnet).expect("login should succeed");
+    set_leverage(TEST_PERP, 1).expect("1x leverage");
+    state::set_order_type(1);
+    assert!(net_position(TEST_PERP).unwrap().abs() < 1e-9, "start flat");
+
+    let price = asset_price(TEST_PERP).expect("price");
+    let units = (110.0 / price * AMOUNT_SCALE).round() as i32;
+    assert_eq!(set_twap_minutes(5), Some(5));
+    let placed = place_order(TEST_PERP, units, 0.0, false, 0.0);
+    set_twap_minutes(0); // whatever happened, later orders fill at once
+    let (id, _, fill) = placed.expect("TWAP should start");
+    assert_eq!(fill, 0, "a TWAP starts with nothing filled");
+
+    // Slices come about every 30s; give two of them time to land.
+    let mut seen = 0;
+    for _ in 0..18 {
+        let (open, _, cost, _, state) = trade_status(id).expect("status");
+        assert!(state >= 0, "a running TWAP is not closed: {state}");
+        if state > 0 {
+            seen = state;
+            println!("filled {state} lots at {open}, cost {cost}");
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(5));
+    }
+    assert!(seen > 0, "no slice filled in 90s");
+    let held = net_position(TEST_PERP).unwrap();
+    assert!(held * AMOUNT_SCALE >= seen as f64 - 1.0,
+        "the exchange holds at least what Zorro was told: {held} vs {seen} lots");
+
+    let outcome = close_trade(id, seen, 0.0).expect("close should stop the TWAP and close");
+    println!("closed {} @ {}, profit {}, cost {}", outcome.fill, outcome.price, outcome.profit, outcome.cost);
+    assert_eq!(outcome.remaining, 0.0, "everything the TWAP filled is closed");
+    assert!(net_position(TEST_PERP).unwrap().abs() < 1e-9, "flat after the close");
+
+    // A TWAP left running would buy again within a slice.
+    std::thread::sleep(std::time::Duration::from_secs(40));
+    assert!(net_position(TEST_PERP).unwrap().abs() < 1e-9, "the TWAP is really stopped");
+    assert_eq!(trade_status(id).unwrap().4, -1, "the trade reads as closed");
+}
+
+/// DO_CANCEL stops a TWAP and keeps what filled; with nothing filled the
+/// trade is simply gone.
+#[test]
+#[ignore]
+fn cancels_a_twap_entry() {
+    login(None, BaseUrl::Testnet).expect("login should succeed");
+    set_leverage(TEST_PERP, 1).expect("1x leverage");
+    state::set_order_type(1);
+    let price = asset_price(TEST_PERP).expect("price");
+    let units = (110.0 / price * AMOUNT_SCALE).round() as i32;
+
+    // Under the exchange's $100 minimum: refused here, before sending.
+    set_twap_minutes(5);
+    let small = place_order(TEST_PERP, units / 2, 0.0, false, 0.0);
+    println!("undersized TWAP: {small:?}");
+    assert!(small.unwrap_err().contains("at least $100"));
+
+    let placed = place_order(TEST_PERP, units, 0.0, false, 0.0);
+    set_twap_minutes(0);
+    let (id, _, _) = placed.expect("TWAP should start");
+    cancel_order(id).expect("DO_CANCEL stops the TWAP");
+    let (_, _, _, _, state) = trade_status(id).unwrap();
+    println!("after cancel: state {state}");
+    if state > 0 {
+        // A first slice beat the cancel: it is a real position, so close it.
+        close_trade(id, state, 0.0).expect("close the filled slice");
+    } else {
+        assert_eq!(state, crate::ffi::NAY - 1, "nothing filled: gone like a cancelled order");
+    }
+    assert!(net_position(TEST_PERP).unwrap().abs() < 1e-9, "flat at the end");
+}
+
+/// Cleanup: stops any TWAP left running by a failed test, then flattens
+/// the test perp.
+#[test]
+#[ignore]
+fn stops_leftover_twaps() {
+    login(None, BaseUrl::Testnet).expect("login should succeed");
+    for (id, coin) in running_twaps() {
+        println!("stopping TWAP {id} on {coin}: {:?}", cancel_twap_by_id(&coin, id));
+    }
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    let held = net_position(TEST_PERP).unwrap();
+    if held.abs() > 0.0 {
+        state::set_order_type(1);
+        let units = (held.abs() * AMOUNT_SCALE).round() as i32;
+        println!("flatten {held}: {:?}", place_order(TEST_PERP, if held > 0.0 { -units } else { units }, 0.0, true, 0.0));
+    }
+    assert!(running_twaps().is_empty(), "a TWAP is still running");
+    assert!(net_position(TEST_PERP).unwrap().abs() < 1e-9, "flat");
+}

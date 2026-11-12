@@ -46,6 +46,11 @@ pub struct TradeInfo {
     /// True while the order was last seen resting unfilled. Lets an order
     /// the exchange briefly calls unknown keep its last known state.
     pub pending: bool,
+    /// Set for a trade entered as a TWAP: the exchange's id for it. Such a
+    /// trade has no order id; it grows as the TWAP's slices fill.
+    pub twap_id: Option<u64>,
+    /// True while that TWAP is still slicing on the exchange.
+    pub twap_running: bool,
 }
 
 impl TradeInfo {
@@ -184,6 +189,8 @@ pub fn register_trade(coin: &str, oid: u64, is_buy: bool, entry_price: f64, entr
                 close_fees: 0.0,
                 stop_oid: None,
                 pending: false,
+                twap_id: None,
+                twap_running: false,
             },
         );
     }
@@ -225,6 +232,33 @@ pub fn set_entry_fee(zorro_id: i32, fee: f64) {
     with_trade(zorro_id, |info| {
         info.entry_fee = fee;
         info.entry_fee_final = true;
+    });
+}
+
+/// Marks a trade as entered by the TWAP `twap_id`, still running.
+pub fn set_twap(zorro_id: i32, twap_id: u64) {
+    with_trade(zorro_id, |info| {
+        info.twap_id = Some(twap_id);
+        info.twap_running = true;
+    });
+}
+
+/// Brings a TWAP trade up to date with its slices: `filled` so far at
+/// `avg_price`, `fees` paid. Once the TWAP has stopped, what filled is the
+/// whole trade and its fee is final.
+pub fn set_twap_progress(zorro_id: i32, filled: f64, avg_price: f64, fees: f64, running: bool) {
+    with_trade(zorro_id, |info| {
+        if filled > 0.0 {
+            info.entry_price = avg_price;
+        }
+        info.remaining_sz = filled;
+        info.entry_fee = fees;
+        info.twap_running = running;
+        if !running {
+            info.entry_sz = filled;
+            info.entry_fee_final = true;
+            info.closed = filled <= 0.0;
+        }
     });
 }
 
