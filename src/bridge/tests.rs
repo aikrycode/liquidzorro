@@ -796,6 +796,36 @@ fn modifies_a_resting_order_in_place() {
     assert_eq!(net_position(TEST_PERP).unwrap_or(0.0), 0.0, "nothing may have filled");
 }
 
+/// Hyperliquid places a modified order post-only whatever it was, and
+/// cancels the original before refusing a replacement that would trade.
+/// The plugin must refuse a move through the book itself, so a GTC order
+/// asked to cross keeps resting. Here on spot; the perp stress test does
+/// the same on ETH.
+#[test]
+#[ignore]
+fn a_modify_through_the_book_is_refused_and_the_order_keeps_resting() {
+    login(None, BaseUrl::Testnet).expect("login should succeed");
+    let plugin = state::get().unwrap();
+    state::set_order_type(2); // GTC
+    let price = asset_price(TEST_SPOT).expect("price");
+    let units = (minimum_qty(price) * 1.2 * AMOUNT_SCALE).round() as i32;
+    let (id, _, fill) = place_order(TEST_SPOT, units, price * 0.97, false, 0.0).expect("rest");
+    state::set_order_type(1);
+    assert_eq!(fill, 0, "a buy 3% under the price must rest");
+
+    let crossed = modify_order(id, price * 1.03, 0);
+    println!("moved through the book: {crossed:?}");
+    assert!(crossed.unwrap_err().contains("still rests"));
+    let oid = state::get_trade(id).unwrap().oid;
+    let order = runtime::get()
+        .block_on(plugin.info_client.query_order_by_oid(plugin.address, oid))
+        .unwrap()
+        .order
+        .expect("the order");
+    assert_eq!(order.status, "open", "the original must still rest");
+    cancel_order(id).expect("cancel");
+}
+
 /// Cleanup: cancels every order still resting on the account, for when a
 /// test fails between placing an order and cancelling it.
 #[test]
@@ -947,3 +977,4 @@ fn stops_leftover_twaps() {
     assert!(running_twaps().is_empty(), "a TWAP is still running");
     assert!(net_position(TEST_PERP).unwrap().abs() < 1e-9, "flat");
 }
+

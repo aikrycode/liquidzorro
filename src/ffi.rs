@@ -434,7 +434,10 @@ const DO_CANCEL: c_int = 301;
 /// DO_MODIFY (plugin-specific): move a resting order in place. `parameter`
 /// points at three `var`s: the Zorro trade id, the new limit price, and the
 /// new size in lots (0 keeps the size). Returns 1 if the order rests at the
-/// new price, 2 if the new price filled it at once, 0 if it was refused.
+/// new price, 0 if it was refused. A move through the book is always
+/// refused, and the order keeps resting: Hyperliquid would refuse it too,
+/// after cancelling the original. (2, filled at once, is kept for an
+/// exchange reply that has not been seen.)
 const DO_MODIFY: c_int = 2001;
 
 /// SET_TWAP (plugin-specific): enter perps as TWAPs over this many

@@ -474,6 +474,14 @@ function run()
 		check("DO_MODIFY moves the resting order in place", Result == 1);
 		for(open_trades) if(TradeID == LimitTradeID) StillPending = 1;
 		check("The modified order is still Zorro's pending trade", StillPending);
+		// Hyperliquid would refuse this after cancelling the original, so
+		// the plugin must refuse it first. The DO_CANCEL next proves the
+		// order is still there.
+		Args[1] = Price*1.03;
+		Args[2] = 0;
+		Result = brokerCommand(CMD_DO_MODIFY, Args);
+		printf("\nDO_MODIFY %d through the book @ %.2f: %.0f", LimitTradeID, Args[1], Result);
+		check("DO_MODIFY refuses a move through the book", Result == 0);
 		Phase = PH_LIMIT_CANCEL;
 		return;
 	}

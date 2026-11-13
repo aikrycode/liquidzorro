@@ -36,6 +36,10 @@ pub struct TradeInfo {
     /// be acknowledged before it is indexed there, so the lookup is retried
     /// rather than losing the fee.
     pub entry_fee_final: bool,
+    /// The part of the entry fee paid in the coin bought (spot buys only),
+    /// already taken off the size. A spot buy receives that much less than
+    /// it filled, so the size Zorro tracks must not include it.
+    pub entry_fee_in_coin: f64,
     /// Fees of the closes booked against this trade so far. Kept apart from
     /// `entry_fee` so retrying the entry lookup cannot overwrite them.
     pub close_fees: f64,
@@ -54,6 +58,32 @@ pub struct TradeInfo {
 }
 
 impl TradeInfo {
+    /// Books the entry fees read so far: `usd` in all, `in_coin` of it paid
+    /// in the coin bought. The coin part comes off the size -- now if the
+    /// order has filled, else when it does (`fill_resting`). `done` once the
+    /// order has filled completely; until then later pieces add more.
+    pub fn book_entry_fees(&mut self, usd: f64, in_coin: f64, done: bool) {
+        let new = in_coin - self.entry_fee_in_coin;
+        self.entry_fee = usd;
+        self.entry_fee_in_coin = in_coin;
+        if !self.pending {
+            self.entry_sz -= new;
+            self.remaining_sz = (self.remaining_sz - new).max(0.0);
+        }
+        self.entry_fee_final = done;
+    }
+
+    /// A resting order has filled: what is held is its size less any fee
+    /// paid in the coin.
+    pub fn fill_resting(&mut self) {
+        if !self.pending {
+            return;
+        }
+        self.pending = false;
+        self.entry_sz -= self.entry_fee_in_coin;
+        self.remaining_sz = self.entry_sz;
+    }
+
     /// Every fee this trade has paid, entry and closes together.
     pub fn total_fees(&self) -> f64 {
         self.entry_fee + self.close_fees
@@ -186,6 +216,7 @@ pub fn register_trade(coin: &str, oid: u64, is_buy: bool, entry_price: f64, entr
                 closed: false,
                 entry_fee: 0.0,
                 entry_fee_final: false,
+                entry_fee_in_coin: 0.0,
                 close_fees: 0.0,
                 stop_oid: None,
                 pending: false,
@@ -228,11 +259,12 @@ pub fn take_stop_oid(zorro_id: i32) -> Option<u64> {
 }
 
 /// Records what the entry fill cost, and stops the lookup being retried.
-pub fn set_entry_fee(zorro_id: i32, fee: f64) {
-    with_trade(zorro_id, |info| {
-        info.entry_fee = fee;
-        info.entry_fee_final = true;
-    });
+pub fn book_entry_fees(zorro_id: i32, usd: f64, in_coin: f64, done: bool) {
+    with_trade(zorro_id, |info| info.book_entry_fees(usd, in_coin, done));
+}
+
+pub fn fill_resting(zorro_id: i32) {
+    with_trade(zorro_id, |info| info.fill_resting());
 }
 
 /// Marks a trade as entered by the TWAP `twap_id`, still running.

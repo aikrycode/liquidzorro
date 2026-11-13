@@ -254,9 +254,9 @@ filled, and Zorro only keeps polling a GTC order, so it would never see the slic
                     order.oid
                 ));
             }
-            let zorro_id = state::register_trade(symbol, order.oid, is_buy, price, fill_sz);
+            let zorro_id = state::register_trade(symbol, order.oid, is_buy, price, gross_sz);
             if let Some(fees) = fees {
-                state::set_entry_fee(zorro_id, fees.usd);
+                state::book_entry_fees(zorro_id, fees.usd, fees.in_base, true);
             }
             // A stop only means something once there is a fill to protect.
             if stop_dist > 0.0 {
@@ -360,17 +360,17 @@ pub fn modify_order(zorro_id: i32, new_limit: f64, new_amount: i32) -> Result<i3
         // a reduce-only close stays reduce-only.
         let tif = order.order.tif.clone().unwrap_or_else(|| "Gtc".to_string());
         // Hyperliquid carries out a modify by cancelling the order and then
-        // placing the new one, so a refused replacement leaves no order at
-        // all. Refuse a post-only move through the book here, while the
-        // original is still safely resting.
-        if tif == "Alo" {
-            if let Some(opposite) = best_offer(&plugin.info_client, &info.coin, info.is_buy).await {
-                if would_cross(info.is_buy, limit_px, opposite) {
-                    return Err(format!(
-                        "post-only order cannot move to {limit_px}: the best {} is {opposite}, so it would cross the book; the order still rests where it was",
-                        if info.is_buy { "ask" } else { "bid" }
-                    ));
-                }
+        // placing the new one, and it places that one post-only whatever
+        // the order was: a GTC order moved through the book is refused with
+        // "Post only order would have immediately matched" (live, perp and
+        // spot alike), leaving no order at all. So refuse any move through
+        // the book here, while the original is still safely resting.
+        if let Some(opposite) = best_offer(&plugin.info_client, &info.coin, info.is_buy).await {
+            if would_cross(info.is_buy, limit_px, opposite) {
+                return Err(format!(
+                    "cannot move the order to {limit_px}: the best {} is {opposite}, and Hyperliquid refuses a modify that would trade at once (cancelling the original). The order still rests where it was; to trade now, cancel it and send a market order",
+                    if info.is_buy { "ask" } else { "bid" }
+                ));
             }
         }
         let request = ClientModifyRequest {
@@ -1048,6 +1048,22 @@ pub fn trade_status(zorro_id: i32) -> Option<(f64, f64, f64, f64, i32)> {
     let status = runtime::get()
         .block_on(plugin.info_client.query_order_by_oid(plugin.address, info.oid))
         .ok()?;
+    let order_state = status.order.as_ref().map(|o| o.status.clone());
+    let open_sz = status.order.as_ref().and_then(|o| o.order.sz.parse::<f64>().ok());
+    let all_filled = order_state.as_deref() == Some("filled");
+
+    // Fees before sizes: a spot buy's fee is paid in the coin, and comes off
+    // the size reported below. Until the order has filled completely, later
+    // pieces bring more fees, so the lookup stays open.
+    if !info.entry_fee_final && has_filled(order_state.as_deref(), open_sz, info.entry_sz) {
+        if let Some(fees) = order_fees(info.oid) {
+            state::book_entry_fees(zorro_id, fees.usd, fees.in_base, all_filled);
+        }
+    }
+    if all_filled {
+        state::fill_resting(zorro_id);
+    }
+    let info = state::get_trade(zorro_id)?;
 
     let close_price = asset_price(&info.coin).unwrap_or(info.entry_price);
     let direction = if info.is_buy { 1.0 } else { -1.0 };
@@ -1055,43 +1071,41 @@ pub fn trade_status(zorro_id: i32) -> Option<(f64, f64, f64, f64, i32)> {
     // fill_state is in AMOUNT_SCALE sub-units, like BrokerBuy2's fill_amount.
     // filled_sz drives profit: an order still resting has none, so it must
     // not accrue P&L just because the market moved away from its limit.
-    let (fill_state, filled_sz) = match status.order {
+    let (fill_state, filled_sz) = match order_state.as_deref() {
         // Testnet calls a just-placed order unknown for a moment, and an
         // order the exchange accepted is never forgotten: report the last
         // known state and ask again on the next poll. Reading unknown as
         // closed made Zorro drop a freshly resting limit order.
         None => last_known_fill(&info),
-        Some(order_info) => match order_info.status.as_str() {
-            // Report what is still open, not the original fill: partial
-            // closes shrink the trade and Zorro tracks it by this number.
-            "filled" => {
-                if info.pending {
-                    state::set_pending(zorro_id, false);
-                }
-                last_known_fill(&state::TradeInfo { pending: false, ..info.clone() })
-            }
-            "canceled" | "rejected" | "marginCanceled" => (NAY - 1, 0.0),
-            _ => {
-                let remaining: f64 = order_info.order.sz.parse().unwrap_or(info.entry_sz);
-                let filled = (info.entry_sz - remaining).max(0.0);
-                ((filled * AMOUNT_SCALE).round() as i32, filled)
-            }
-        },
+        // Report what is still open, not the original fill: partial
+        // closes shrink the trade and Zorro tracks it by this number.
+        Some("filled") => last_known_fill(&info),
+        Some("canceled" | "rejected" | "marginCanceled") => (NAY - 1, 0.0),
+        // Partly filled and still resting: what filled, less any fee taken
+        // in the coin so far.
+        Some(_) => {
+            let remaining = open_sz.unwrap_or(info.entry_sz);
+            let filled = (info.entry_sz - remaining - info.entry_fee_in_coin).max(0.0);
+            ((filled * AMOUNT_SCALE).round() as i32, filled)
+        }
     };
     let profit = direction * (close_price - info.entry_price) * filled_sz;
-
-    // Retry the fee lookup until the fills feed has caught up with the fill.
-    if !info.entry_fee_final && filled_sz > 0.0 {
-        if let Some(fees) = order_fees(info.oid) {
-            state::set_entry_fee(zorro_id, fees.usd);
-        }
-    }
     // pProfit is gross by contract ("without rollover and commission"), so
     // fees and funding go out through pCost instead. Negative is money paid.
     let fees = state::get_trade(zorro_id).map_or_else(|| info.total_fees(), |t| t.total_fees());
     let cost = -(fees + trade_funding(&info.coin, filled_sz));
 
     Some((info.entry_price, close_price, cost, profit, fill_state))
+}
+
+/// Whether an order in `state`, with `open_sz` of its `entry_sz` still
+/// resting, has filled any of it -- and so has fees to look up.
+fn has_filled(state: Option<&str>, open_sz: Option<f64>, entry_sz: f64) -> bool {
+    match state {
+        Some("filled") => true,
+        None | Some("canceled" | "rejected" | "marginCanceled") => false,
+        Some(_) => open_sz.is_some_and(|open| open < entry_sz),
+    }
 }
 
 /// `(fill_state, filled_sz)` from what the plugin last knew of a trade:
@@ -1119,12 +1133,66 @@ mod unknown_order_tests {
             closed: false,
             entry_fee: 0.0,
             entry_fee_final: false,
+            entry_fee_in_coin: 0.0,
             close_fees: 0.0,
             stop_oid: None,
             pending,
             twap_id: None,
             twap_running: false,
         }
+    }
+
+    /// Only an order with something filled has fees to look up.
+    #[test]
+    fn looks_up_fees_once_anything_filled() {
+        assert!(has_filled(Some("filled"), Some(0.0), 1.0));
+        assert!(has_filled(Some("open"), Some(0.4), 1.0));
+        assert!(!has_filled(Some("open"), Some(1.0), 1.0));
+        assert!(!has_filled(Some("canceled"), Some(0.4), 1.0));
+        assert!(!has_filled(None, None, 1.0));
+    }
+
+    /// A spot buy that rests, then fills in two pieces: the fee is paid in
+    /// the coin, so what Zorro is told it holds is the size less that fee,
+    /// and the lookup stays open until the order has filled completely.
+    #[test]
+    fn a_resting_spot_buy_is_held_net_of_its_coin_fee() {
+        let mut t = trade(true);
+        t.entry_sz = 10.0;
+        t.remaining_sz = 10.0;
+        t.book_entry_fees(0.02, 0.004, false); // first piece, still resting
+        assert_eq!((t.entry_sz, t.remaining_sz, t.entry_fee_final), (10.0, 10.0, false));
+        t.book_entry_fees(0.05, 0.01, true); // the rest filled
+        t.fill_resting();
+        assert!(!t.pending);
+        assert!((t.remaining_sz - 9.99).abs() < 1e-12, "{}", t.remaining_sz);
+        assert_eq!(t.entry_sz, t.remaining_sz);
+        assert_eq!(t.entry_fee, 0.05);
+        assert!(t.entry_fee_final);
+        // A later poll changes nothing.
+        t.fill_resting();
+        assert!((t.remaining_sz - 9.99).abs() < 1e-12);
+    }
+
+    /// Filled at once but the fee not yet indexed: tracked gross, then
+    /// corrected when the fee turns up.
+    #[test]
+    fn a_late_coin_fee_comes_off_a_filled_trade() {
+        let mut t = trade(false);
+        t.entry_sz = 10.0;
+        t.remaining_sz = 10.0;
+        t.book_entry_fees(0.05, 0.01, true);
+        assert!((t.remaining_sz - 9.99).abs() < 1e-12);
+        assert!((t.entry_sz - 9.99).abs() < 1e-12);
+    }
+
+    /// A fee in USDC (perps, spot sells) leaves the size alone.
+    #[test]
+    fn a_usdc_fee_leaves_the_size_alone() {
+        let mut t = trade(true);
+        t.book_entry_fees(0.01, 0.0, true);
+        t.fill_resting();
+        assert_eq!(t.remaining_sz, 0.0119);
     }
 
     /// A resting order the exchange has not indexed yet stays pending.
