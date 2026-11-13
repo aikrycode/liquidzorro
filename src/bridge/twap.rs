@@ -5,9 +5,9 @@
 //! crosses. Sliced over time, each piece takes only the best prices, and
 //! the slicing runs on the exchange, so it carries on while Zorro sleeps.
 //!
-//! Switched on by SET_TWAP with a number of minutes, off with 0. To
-//! Zorro a TWAP is an ordinary trade that fills gradually: it starts
-//! pending, `BrokerTrade` reports its size growing slice by slice, and
+//! Switched on by SET_TWAP with a number of minutes, off with 0, and the
+//! entry must be sent as GTC (`setf(TradeMode, TR_GTC)`). To Zorro a TWAP
+//! is an ordinary trade that fills gradually: it starts pending, `BrokerTrade` reports its size growing slice by slice, and
 //! `exitLong`/`exitShort` stop it and close what filled. `DO_CANCEL` stops
 //! it and keeps what filled.
 //!
@@ -93,6 +93,16 @@ fn send(action: &Action) -> Result<String, String> {
 fn asset_index(symbol: &str) -> Result<u32, String> {
     let plugin = state::get().ok_or("not logged in")?;
     plugin.exchange_client.coin_to_asset.get(symbol).copied().ok_or_else(|| format!("no asset index for {symbol}"))
+}
+
+/// Whether Zorro will follow a TWAP entry sent with this SET_ORDERTYPE.
+///
+/// It starts with nothing filled. Zorro keeps polling such a trade only if
+/// it went out as GTC; otherwise it books 0 lots for good and drops the
+/// trade without a close (live: the TWAP then bought its whole size into
+/// a position Zorro no longer held). So only the GTC bit lets it through.
+pub fn entry_is_tracked(order_type: i32) -> bool {
+    order_type & 2 != 0
 }
 
 /// Starts a TWAP buying (or selling) `raw_sz` of `symbol` over `minutes()`
@@ -388,6 +398,16 @@ mod tests {
         assert_eq!(running_from(HISTORY), vec![(1, String::new())]);
         let both = r#"[{"time":2,"state":{"coin":"ETH"},"status":{"status":"terminated"},"twapId":3},{"time":1,"state":{"coin":"ETH"},"status":{"status":"activated"},"twapId":3},{"time":4,"state":{"coin":"BTC"},"status":{"status":"activated"},"twapId":4}]"#;
         assert_eq!(running_from(both), vec![(4, "BTC".to_string())]);
+    }
+
+    #[test]
+    fn only_a_gtc_entry_is_tracked() {
+        assert!(entry_is_tracked(2));
+        assert!(entry_is_tracked(3));
+        assert!(entry_is_tracked(2 + 8));
+        for t in [0, 1, 4, 8, 9] {
+            assert!(!entry_is_tracked(t), "type {t}");
+        }
     }
 
     #[test]

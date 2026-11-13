@@ -819,18 +819,26 @@ fn cancels_leftover_orders() {
     assert!(left.is_empty(), "still resting: {left:?}");
 }
 
-/// Diagnostic: does testnet accept a scheduled cancel from this account?
+/// The dead-man's switch either arms and clears, or -- on an account under
+/// the exchange's $1,000,000 volume bar, as the test account is -- is
+/// refused with that reason and stays off. Either way nothing is left set.
 #[test]
 #[ignore]
-fn probes_schedule_cancel() {
+fn sets_the_dead_man_switch_or_says_why_not() {
     login(None, BaseUrl::Testnet).expect("login should succeed");
-    let plugin = state::get().unwrap();
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
-    let set = runtime::get().block_on(plugin.exchange_client.schedule_cancel(Some(now_ms + 60_000), None));
-    println!("schedule +60s: {set:?}");
-    let clear = runtime::get().block_on(plugin.exchange_client.schedule_cancel(None, None));
-    println!("clear: {clear:?}");
+    match set_deadman(60) {
+        Ok(seconds) => {
+            assert_eq!(seconds, 60);
+            assert_eq!(deadman_seconds(), 60);
+            renew_deadman();
+            assert_eq!(set_deadman(0), Ok(0));
+        }
+        Err(e) => {
+            println!("refused as expected: {e}");
+            assert!(e.contains("enough volume"), "unexpected refusal: {e}");
+        }
+    }
+    assert_eq!(deadman_seconds(), 0, "the switch must end off");
 }
 
 /// A TWAP entry is a Zorro trade that grows as slices fill; closing it
@@ -841,14 +849,15 @@ fn probes_schedule_cancel() {
 fn enters_as_a_twap_and_closes_what_filled() {
     login(None, BaseUrl::Testnet).expect("login should succeed");
     set_leverage(TEST_PERP, 1).expect("1x leverage");
-    state::set_order_type(1);
     assert!(net_position(TEST_PERP).unwrap().abs() < 1e-9, "start flat");
 
     let price = asset_price(TEST_PERP).expect("price");
     let units = (110.0 / price * AMOUNT_SCALE).round() as i32;
     assert_eq!(set_twap_minutes(5), Some(5));
+    state::set_order_type(2); // GTC, as Zorro sends it under TR_GTC
     let placed = place_order(TEST_PERP, units, 0.0, false, 0.0);
     set_twap_minutes(0); // whatever happened, later orders fill at once
+    state::set_order_type(1);
     let (id, _, fill) = placed.expect("TWAP should start");
     assert_eq!(fill, 0, "a TWAP starts with nothing filled");
 
@@ -887,18 +896,25 @@ fn enters_as_a_twap_and_closes_what_filled() {
 fn cancels_a_twap_entry() {
     login(None, BaseUrl::Testnet).expect("login should succeed");
     set_leverage(TEST_PERP, 1).expect("1x leverage");
-    state::set_order_type(1);
     let price = asset_price(TEST_PERP).expect("price");
     let units = (110.0 / price * AMOUNT_SCALE).round() as i32;
+    set_twap_minutes(5);
+
+    // Sent as IOC, Zorro would never follow it: refused before sending.
+    state::set_order_type(1);
+    let untracked = place_order(TEST_PERP, units, 0.0, false, 0.0);
+    println!("IOC TWAP: {untracked:?}");
+    assert!(untracked.unwrap_err().contains("TR_GTC"));
 
     // Under the exchange's $100 minimum: refused here, before sending.
-    set_twap_minutes(5);
+    state::set_order_type(2);
     let small = place_order(TEST_PERP, units / 2, 0.0, false, 0.0);
     println!("undersized TWAP: {small:?}");
     assert!(small.unwrap_err().contains("at least $100"));
 
     let placed = place_order(TEST_PERP, units, 0.0, false, 0.0);
     set_twap_minutes(0);
+    state::set_order_type(1);
     let (id, _, _) = placed.expect("TWAP should start");
     cancel_order(id).expect("DO_CANCEL stops the TWAP");
     let (_, _, _, _, state) = trade_status(id).unwrap();

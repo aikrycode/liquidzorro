@@ -51,6 +51,9 @@
 #define ORDERTYPE_POST_ONLY 4
 // Plugin-specific: enter as a TWAP over this many minutes; 0 = off.
 #define CMD_SET_TWAP       2002
+// Plugin-specific: exchange cancels all open orders if Zorro goes silent
+// this many seconds (30-86400); 0 = off.
+#define CMD_SET_DEADMAN    2003
 // The exchange's smallest TWAP is $100. Only the first slices fill before
 // the test closes it, so it costs cents, not the whole $110.
 #define TWAP_USD        110
@@ -83,6 +86,7 @@
 #define PH_TWAP_CLOSE   25
 #define PH_TWAP_FLAT    26
 #define PH_TWAP_STILL   27
+#define PH_DEADMAN      28
 
 int Phase;
 int Passed, Failed;
@@ -522,7 +526,11 @@ function run()
 		Result = brokerCommand(CMD_SET_TWAP, 5);
 		check("SET_TWAP accepts 5 minutes", Result == 5);
 		Lots = ceil(TWAP_USD/Price*AMOUNT_SCALE);
+		// GTC, so Zorro treats the empty entry as pending and keeps polling
+		// it as slices fill. Sent as IOC it books 0 lots and drops the trade.
+		setf(TradeMode, TR_GTC);
 		enterLong();
+		resf(TradeMode, TR_GTC);
 		// Off at once, so no later entry goes out as a TWAP by accident.
 		brokerCommand(CMD_SET_TWAP, 0);
 		printf("
@@ -575,6 +583,29 @@ Position after closing the TWAP trade: %.0f lots", Held);
 Position a minute later: %.0f lots", Held);
 		check("The closed TWAP buys nothing more", isFlat(Held));
 		check("Zorro holds no TWAP trade afterwards", Trades == 0);
+		Phase = PH_DEADMAN;
+		return;
+	}
+
+	///////////////////////////////////////////////////////////////////////
+	// Dead-man's switch: the plugin keeps a cancel deadline moving on the
+	// exchange; if Zorro goes silent it arrives and all orders go. The
+	// exchange takes it only from accounts with $1,000,000 traded, so on a
+	// test account the honest result is a clean refusal, logged with why.
+	///////////////////////////////////////////////////////////////////////
+	if(Phase == PH_DEADMAN) {
+		var Result;
+		printf("\n--- Dead-man's switch ---");
+		Result = brokerCommand(CMD_SET_DEADMAN, 10);
+		check("SET_DEADMAN refuses a window under 30s", Result == -1);
+		Result = brokerCommand(CMD_SET_DEADMAN, 60);
+		if(Result == 60)
+			printf("\nDead-man's switch armed for 60s");
+		else
+			printf("\nDead-man's switch refused by the exchange (see the plugin's reason above)");
+		check("SET_DEADMAN arms, or is refused cleanly", Result == 60 || Result == -1);
+		Result = brokerCommand(CMD_SET_DEADMAN, 0);
+		check("SET_DEADMAN switches off", Result == 0);
 		Phase = PH_REJECT;
 		return;
 	}

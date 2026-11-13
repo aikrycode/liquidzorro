@@ -90,6 +90,12 @@ pub unsafe extern "C" fn BrokerLogin(
             // the switch for new entries is reset, so the next session
             // starts filling entries at once.
             bridge::set_twap_minutes(0);
+            // Leaving on purpose: orders Zorro left resting are meant to
+            // stay, so the dead-man's schedule is cleared, not left to fire.
+            if let Err(e) = bridge::deadman_off() {
+                state::log_message(&format!("Hyperliquid: dead-man's switch not cleared at logout: {e}"));
+            }
+            bridge::forget_deadman();
             state::clear();
             state::log_message("Hyperliquid: logged out");
             return 1;
@@ -128,6 +134,7 @@ pub unsafe extern "C" fn BrokerTime(p_time_gmt: *mut Date) -> c_int {
         if state::get().is_none() {
             return 0;
         }
+        bridge::renew_deadman();
         if !p_time_gmt.is_null() {
             let unix_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -432,9 +439,19 @@ const DO_MODIFY: c_int = 2001;
 
 /// SET_TWAP (plugin-specific): enter perps as TWAPs over this many
 /// minutes (5-1440) from now on, or 0 to fill entries at once again (the
-/// default). Closes always fill at once. Returns the minutes set, 0 for
+/// default). The entry must be GTC (`setf(TradeMode, TR_GTC)`) so Zorro
+/// keeps polling its fills; any other entry is refused. Closes always fill
+/// at once. Returns the minutes set, 0 for
 /// off, or -1 if out of range.
 const SET_TWAP: c_int = 2002;
+
+/// SET_DEADMAN (plugin-specific): if the plugin hears nothing from Zorro
+/// for this many seconds (30-86400), the exchange cancels every open order
+/// on the account; 0 switches it off (also done at logout). Positions stay
+/// open. Returns the seconds set, 0 for off, or -1 if out of range or
+/// refused by the exchange, which takes it only from accounts that have
+/// traded $1,000,000.
+const SET_DEADMAN: c_int = 2003;
 
 /// SET_SYMBOL: the asset subsequent commands apply to.
 const SET_SYMBOL: c_int = 132;
@@ -460,6 +477,16 @@ pub unsafe extern "C" fn BrokerCommand(command: c_int, parameter: isize) -> f64 
                 state::log_message(&format!(
                     "BrokerCommand(SET_TWAP): {parameter} minutes is outside 5-1440; kept {}",
                     bridge::twap_minutes()
+                ));
+                -1.0
+            }
+        },
+        SET_DEADMAN => match bridge::set_deadman(parameter as i32) {
+            Ok(seconds) => seconds as f64,
+            Err(e) => {
+                state::log_message(&format!(
+                    "BrokerCommand(SET_DEADMAN): {e}; kept {}s",
+                    bridge::deadman_seconds()
                 ));
                 -1.0
             }

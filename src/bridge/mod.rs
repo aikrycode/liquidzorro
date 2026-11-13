@@ -149,6 +149,11 @@ pub fn place_order(
             return Err("a TWAP entry cannot carry a stop: it fills over minutes, and a stop \
 needs the filled size; place the stop once the TWAP is done".to_string());
         }
+        if !twap::entry_is_tracked(state::order_type()) {
+            return Err("a TWAP entry needs setf(TradeMode, TR_GTC): it starts with nothing \
+filled, and Zorro only keeps polling a GTC order, so it would never see the slices fill"
+                .to_string());
+        }
         return twap::place(symbol, is_buy, raw_sz);
     }
 
@@ -1674,6 +1679,12 @@ mod history_window_tests {
         assert_eq!(start, 0);
     }
 }
+
+mod deadman;
+pub use deadman::{
+    forget as forget_deadman, off as deadman_off, renew as renew_deadman, seconds as deadman_seconds,
+    set as set_deadman,
+};
 
 mod twap;
 pub use twap::{minutes as twap_minutes, set_minutes as set_twap_minutes};
