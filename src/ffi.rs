@@ -96,6 +96,9 @@ pub unsafe extern "C" fn BrokerLogin(
                 state::log_message(&format!("Hyperliquid: dead-man's switch not cleared at logout: {e}"));
             }
             bridge::forget_deadman();
+            // a SET_SYMBOL scope or held SET_LEVERAGE is this session's only
+            state::take_symbol();
+            state::take_leverage_request();
             state::clear();
             state::log_message("Hyperliquid: logged out");
             return 1;
@@ -310,6 +313,22 @@ pub unsafe extern "C" fn BrokerBuy2(
             (true, true) => "close short",
             (false, true) => "close long",
         };
+        // A SET_LEVERAGE with no SET_SYMBOL is meant for this order's asset.
+        // An entry at a leverage that could not be set is not placed; a
+        // close goes ahead, since it only frees margin.
+        match bridge::apply_leverage_request(symbol) {
+            Ok(Some(leverage)) => state::log_message(&format!(
+                "BrokerCommand(SET_LEVERAGE): {symbol} set to {leverage}x cross"
+            )),
+            Ok(None) => {}
+            Err(e) if closing => {
+                state::log_message(&format!("BrokerBuy2: SET_LEVERAGE {e}; closing anyway"));
+            }
+            Err(e) => {
+                state::log_message(&format!("BrokerBuy2: {side} {symbol} FAILED: SET_LEVERAGE {e}"));
+                return 0;
+            }
+        }
         match bridge::place_order(symbol, amount, limit, closing, stop) {
             Ok((zorro_id, price, fill)) => {
                 if !p_price.is_null() {
@@ -459,7 +478,10 @@ const SET_DEADMAN: c_int = 2003;
 /// SET_SYMBOL: the asset subsequent commands apply to.
 const SET_SYMBOL: c_int = 132;
 
-/// SET_LEVERAGE: leverage for subsequent perp trades on the SET_SYMBOL asset.
+/// SET_LEVERAGE: leverage for perp trades. Right after a SET_SYMBOL it is
+/// set on that asset at once; otherwise -- as when Zorro sends it by itself
+/// before an order -- it is held and set on the asset of the next order.
+/// Returns the leverage, or 0 if refused (logged).
 const SET_LEVERAGE: c_int = 140;
 
 /// Unhandled codes return 0, which Zorro reads as "unsupported".
@@ -502,12 +524,17 @@ pub unsafe extern "C" fn BrokerCommand(command: c_int, parameter: isize) -> f64 
             None => 0.0,
         },
         SET_LEVERAGE => {
-            // applies to whichever asset SET_SYMBOL last named
-            let Some(symbol) = state::symbol() else {
-                state::log_message("BrokerCommand(SET_LEVERAGE): no symbol set");
-                return 0.0;
-            };
             let leverage = parameter as i32;
+            if leverage < 1 {
+                state::log_message(&format!(
+                    "BrokerCommand(SET_LEVERAGE): {leverage} refused, leverage must be at least 1"
+                ));
+                return 0.0;
+            }
+            let Some(symbol) = state::take_symbol() else {
+                state::request_leverage(leverage as u32);
+                return leverage as f64;
+            };
             match bridge::set_leverage(&symbol, leverage.max(0) as u32) {
                 Ok(applied) => {
                     if applied {

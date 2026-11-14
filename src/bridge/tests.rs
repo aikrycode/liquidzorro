@@ -425,6 +425,38 @@ fn flattens_leftover_balance() {
     }
 }
 
+/// Zorro sends SET_LEVERAGE before every order with no SET_SYMBOL, so a
+/// held request goes to the asset of the next order -- here BTC -- and not
+/// to an asset named earlier. Reads both back after a re-login, so the
+/// figures come from the exchange, then restores BTC to 1x. No orders.
+#[test]
+#[ignore]
+fn a_held_leverage_goes_to_the_next_orders_asset() {
+    const OTHER_PERP: &str = "BTC";
+    login(None, BaseUrl::Testnet).expect("login should succeed");
+    set_leverage(TEST_PERP, 1).expect("1x");
+    set_leverage(OTHER_PERP, 1).expect("1x");
+
+    state::request_leverage(2);
+    assert_eq!(apply_leverage_request(OTHER_PERP), Ok(Some(2)));
+    assert_eq!(apply_leverage_request(OTHER_PERP), Ok(None), "a request is used once");
+    state::request_leverage(2);
+    assert_eq!(apply_leverage_request(OTHER_PERP), Ok(None), "2x is already set: no request");
+
+    login(None, BaseUrl::Testnet).expect("re-login should succeed");
+    let other = current_leverage(OTHER_PERP);
+    let test = current_leverage(TEST_PERP);
+    set_leverage(OTHER_PERP, 1).expect("restore 1x");
+    println!("{OTHER_PERP} {other:?}, {TEST_PERP} {test:?}");
+    assert_eq!(other, Some(2), "the request must reach the order's asset");
+    assert_eq!(test, Some(1), "and leave the other asset alone");
+
+    state::request_leverage(1000);
+    let refused = apply_leverage_request(OTHER_PERP).unwrap_err();
+    println!("{refused}");
+    assert!(refused.contains("exceeds the maximum"));
+}
+
 /// Leverage must be visible with no position open: the clearinghouse state
 /// lists only open positions, so reading it there left `BrokerAsset`
 /// reporting 1x margin and Zorro under-sizing the first entry after a

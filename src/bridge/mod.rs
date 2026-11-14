@@ -1414,6 +1414,11 @@ pub fn set_leverage(symbol: &str, leverage: u32) -> Result<bool, String> {
     if leverage == 0 {
         return Err("leverage must be at least 1".to_string());
     }
+    // Zorro repeats the same value before every order; one that is
+    // already set needs no request.
+    if state::cached_leverage(symbol) == Some(leverage) {
+        return Ok(false);
+    }
     let response = runtime::get().block_on(async {
         let asset = resolve_asset(&plugin.info_client, symbol).await?;
         // Zorro sends this before every order, spot included. Spot is
@@ -1447,6 +1452,20 @@ pub fn set_leverage(symbol: &str, leverage: u32) -> Result<bool, String> {
             state::cache_leverage(symbol, leverage);
             Ok(true)
         }
+    }
+}
+
+/// Applies a SET_LEVERAGE that came with no SET_SYMBOL to the asset of the
+/// order about to be placed -- Zorro sends one before every order. `Ok`
+/// with the leverage set, if one was waiting and changed anything.
+pub fn apply_leverage_request(symbol: &str) -> Result<Option<u32>, String> {
+    let Some(leverage) = state::take_leverage_request() else {
+        return Ok(None);
+    };
+    match set_leverage(symbol, leverage) {
+        Ok(true) => Ok(Some(leverage)),
+        Ok(false) => Ok(None),
+        Err(e) => Err(format!("{leverage}x on {symbol}: {e}")),
     }
 }
 

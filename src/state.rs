@@ -135,15 +135,31 @@ pub fn order_type() -> i32 {
 }
 
 // Asset named by the last SET_SYMBOL, which scopes commands like
-// SET_LEVERAGE that carry no symbol of their own.
+// SET_LEVERAGE that carry no symbol of their own. A SET_LEVERAGE uses it
+// up: Zorro sends SET_LEVERAGE by itself before every order, with no
+// SET_SYMBOL, and a scope left over from an earlier asset would send that
+// leverage to the wrong one.
 static SYMBOL: Mutex<Option<String>> = Mutex::new(None);
 
 pub fn set_symbol(symbol: &str) {
     *SYMBOL.lock().unwrap_or_else(|e| e.into_inner()) = Some(symbol.to_string());
 }
 
-pub fn symbol() -> Option<String> {
-    SYMBOL.lock().unwrap_or_else(|e| e.into_inner()).clone()
+/// The SET_SYMBOL asset, which this call uses up.
+pub fn take_symbol() -> Option<String> {
+    SYMBOL.lock().unwrap_or_else(|e| e.into_inner()).take()
+}
+
+// A SET_LEVERAGE with no SET_SYMBOL before it, held for the asset of the
+// next order.
+static LEVERAGE_REQUEST: Mutex<Option<u32>> = Mutex::new(None);
+
+pub fn request_leverage(leverage: u32) {
+    *LEVERAGE_REQUEST.lock().unwrap_or_else(|e| e.into_inner()) = Some(leverage);
+}
+
+pub fn take_leverage_request() -> Option<u32> {
+    LEVERAGE_REQUEST.lock().unwrap_or_else(|e| e.into_inner()).take()
 }
 
 struct Callbacks {
@@ -334,7 +350,21 @@ fn apply_close(remaining_sz: f64, entry_sz: f64, qty: f64) -> (f64, bool) {
 
 #[cfg(test)]
 mod tests {
-    use super::apply_close;
+    use super::{apply_close, request_leverage, set_symbol, take_leverage_request, take_symbol};
+
+    /// A SET_SYMBOL scopes one SET_LEVERAGE, and a held SET_LEVERAGE one
+    /// order: neither may linger and steer a later one to the wrong asset.
+    #[test]
+    fn a_symbol_scope_and_a_held_leverage_are_used_once() {
+        set_symbol("ETH");
+        assert_eq!(take_symbol().as_deref(), Some("ETH"));
+        assert_eq!(take_symbol(), None, "Zorro's next SET_LEVERAGE must not go to ETH");
+
+        request_leverage(3);
+        request_leverage(2); // the later one wins
+        assert_eq!(take_leverage_request(), Some(2));
+        assert_eq!(take_leverage_request(), None);
+    }
 
     /// Overfilling one chunk must not retire a trade that still holds more:
     /// doing so made Zorro drop a position with a third of it still open.

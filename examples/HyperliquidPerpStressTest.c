@@ -255,6 +255,13 @@ function run()
 		brokerCommand(CMD_SET_SYMBOL, SymbolTrade);
 		Result = brokerCommand(CMD_SET_LEVERAGE, MAX_LEVERAGE);
 		check("SET_LEVERAGE is accepted", Result == MAX_LEVERAGE);
+		// The SET_SYMBOL above is used up. Zorro sends SET_LEVERAGE like
+		// this before every order; the plugin holds it and sets it on the
+		// next order's asset -- the long below.
+		Result = brokerCommand(CMD_SET_LEVERAGE, MAX_LEVERAGE);
+		check("SET_LEVERAGE without SET_SYMBOL is held for the next order", Result == MAX_LEVERAGE);
+		Result = brokerCommand(CMD_SET_LEVERAGE, 0);
+		check("SET_LEVERAGE 0 is refused", Result == 0);
 		Phase = PH_OPEN_LONG;
 		return;
 	}
