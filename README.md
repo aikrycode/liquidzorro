@@ -111,7 +111,7 @@ You can switch between Demo and Real, or paste a different key, and press `[Trad
 - **`Step == 1`:** waits for the fill, splits the total into `Lots1`/`Lots2`.
 - **`Step == 2`/`3`:** sells each half through `sellViaShort()`, a helper around `enterShort()`. Hyperliquid spot has no shorting, so the plugin treats it as a plain sell. The plugin's own `BrokerBuy2` OK/FAILED line records what actually happened.
 - **`Step == 4`:** re-reads `GET_POSITION` and sweeps anything above the dust threshold, covering partially filled sells.
-- **`AMOUNT_SCALE` (100000):** `Lots` counts `1/AMOUNT_SCALE` sub-units, letting a whole-number `Amount` express fractional coin quantities. Matches `bridge::AMOUNT_SCALE` and the CSV's `LotAmount` column.
+- **`AMOUNT_SCALE`:** lots per coin, `1/LotAmount` of the current asset -- see [Lot size](#lot-size).
 
 ### Stress test strategy
 
@@ -126,6 +126,60 @@ What it covers:
 - An order under the exchange's $10 minimum, to confirm it is refused cleanly.
 
 It trades FTEST/USDC (`@171`), a testnet pair with a ~0.3% spread and 0.01-coin size steps, holds at most ~$75 at once, and loses only spread and fees -- well under a dollar a run. Edit `MIN_BALANCE` (default 750) to set the floor it refuses to trade below, and `CYCLES` to change how many round trips it makes.
+
+`examples/HyperliquidPerpStressTest.c` does the same for perpetuals on ETH, plus a whole-coin perp (kPEPE): leverage, a long and a real short, stops, limit, post-only and modified orders, a TWAP, the dead-man's switch and a refused `LotAmount` mismatch. It runs at 1x with about $15 open at a time.
+
+## Writing a strategy for Hyperliquid
+
+The rules below are what a script needs beyond ordinary Zorro. The example scripts follow all of them.
+
+### Lot size
+
+Zorro passes order sizes as a 32-bit count of lots, so one lot has to be a fraction of a coin for fine sizes and large enough that a cheap coin's order still fits. The plugin uses:
+
+| Asset | One lot | `LotAmount` in the asset list |
+|---|---|---|
+| traded in fractions of a coin (BTC, ETH, HYPE, FTEST, ...) | 0.00001 coin | `0.00001` |
+| traded only in whole coins -- exchange size decimals 0 (kPEPE, PURR, most coins under a cent) | 1 coin | `1` |
+
+- **Size orders from `LotAmount`, never from a constant:** `Lots = ceil(Usd/priceClose()/LotAmount);`. The example scripts define `AMOUNT_SCALE` as `1./LotAmount` for this.
+- **Positions and fills are in the same lots:** `GET_POSITION` and Zorro's `TradeLots` count lots of the asset, so divide by `AMOUNT_SCALE` for coins.
+- **A wrong `LotAmount` is refused, not traded:** Zorro sends `LotAmount` before every order, and the plugin refuses an entry whose value does not match its own lot. The log names the right value, e.g. `set LotAmount 1 in the asset list`. Closes go ahead, since they are sized from the trade.
+- **With 0.00001 a single order holds at most about 21,000 coins** -- ample for coins traded in fractions, which are priced well above a cent.
+
+### Spot and perpetuals
+
+- **Perps close normally:** `exitLong`/`exitShort` close a position; the plugin sends them reduce-only, so an oversized close flattens instead of flipping. Shorts are real.
+- **Spot has no shorting:** a sell only reduces what you hold. The spot examples set `Hedge = 2` and sell through `enterShort` so the sale stands on its own.
+- **Spot buys pay their fee in the coin bought:** the trade is held net of it, and the last fraction of a size step cannot be sold (see Known Issues).
+- **Symbols:** perps by coin name (`ETH`), spot by pair (`PURR/USDC`) or `@<index>`, mapped in the asset list's `Symbol` column.
+
+### Orders
+
+- **`SET_ORDERTYPE`:** `0` and `1` immediate-or-cancel, `2` GTC, `4` post-only GTC (plugin-specific). A market order (no `OrderLimit`) is always immediate-or-cancel.
+- **A resting limit order** needs `OrderLimit` and GTC; Zorro then polls it until it fills or is cancelled. Orders under the exchange's $10 minimum are refused.
+- **A TWAP entry** must be sent with `setf(TradeMode, TR_GTC)`, or Zorro never sees its slices fill.
+- **Stops:** a `Stop` on an entry is placed on the exchange as a stop-market order, so it holds if Zorro stops.
+
+### Plugin commands
+
+| Command | Code | Parameter | Returns |
+|---|---|---|---|
+| `SET_SYMBOL` | 132 | asset symbol | 1 |
+| `SET_LEVERAGE` | 140 | leverage, cross margin | the leverage, 0 if refused. Right after `SET_SYMBOL` it is set on that asset at once; otherwise on the asset of the next order |
+| `GET_POSITION` | 53 | asset symbol | signed position in lots, read from the exchange |
+| `SET_ORDERTYPE` | 157 | see above | the type |
+| `DO_CANCEL` | 301 | trade id | 1 if cancelled |
+| `DO_MODIFY` | 2001 | `var[3]`: trade id, new limit, new lots (0 keeps the size) | 1 if the order rests at the new price, 0 if refused -- always for a move through the book |
+| `SET_TWAP` | 2002 | minutes, 5-1440; 0 off | the minutes, -1 if out of range |
+| `SET_DEADMAN` | 2003 | seconds, 30-86400; 0 off | the seconds, -1 if refused |
+
+### Settings
+
+- `set(NFA|OFF)` -- lifts Zorro's NFA restrictions; Hyperliquid has none.
+- `SaveMode = 0` -- start each run from a clean slate; the plugin does not restore trades from an earlier session.
+- `BarMode = 0; StartWeek = 10000; EndWeek = 72359;` -- crypto trades through the weekend, which Zorro otherwise treats as market closed.
+- 32-bit `Zorro.exe` with Lite-C (see Known Issues for 64-bit).
 
 ## Support
 
@@ -148,5 +202,6 @@ This address only ever changes in a signed commit -- before sending, check that 
 - **TWAP entries (`SET_TWAP`) must be sent as GTC:** wrap the entry in `setf(TradeMode, TR_GTC)` ... `resf(TradeMode, TR_GTC)`. A TWAP starts with nothing filled, and Zorro only keeps polling a GTC order; sent any other way it would book 0 lots and never see the slices, so the plugin refuses it. TWAPs are perps only, at least $100, 5-1440 minutes, and carry no stop. A TWAP keeps slicing on the exchange if Zorro stops or crashes.
 - **Dead-man's switch (`SET_DEADMAN`) needs $1,000,000 of lifetime volume:** Hyperliquid refuses a scheduled cancel from any account that has traded less, so on most accounts, testnet included, the command returns -1 and logs the exchange's reason. It has only been tested up to that refusal. When it fires it cancels open orders, including the plugin's exchange-side stops, but leaves positions open; Hyperliquid allows 10 firings a day. Whether it also stops a running TWAP is not yet known.
 - **`DO_MODIFY` cannot move an order through the book:** Hyperliquid places the modified order as post-only whatever it was, and cancels the original before refusing a replacement that would trade at once. The plugin therefore refuses such a move itself (returns 0, logged) and the order keeps resting; to trade at once, cancel it and send a market order.
-- **Very cheap coins can overflow the order size:** Zorro passes amounts as a 32-bit lot count at 100,000 lots per coin, so an order of more than about 21,000 coins cannot be expressed -- e.g. $60 of a coin priced under about $0.003.
+- **`LotAmount` depends on the asset:** `0.00001` for assets traded in fractions of a coin, `1` for those traded only in whole coins (PURR/USDC, kPEPE and most coins under a cent). An asset list with the old `0.00001` for a whole-coin asset gets its entries refused, with the right value in the log; see [Lot size](#lot-size).
+- **Zorro's log shows sub-cent prices as 0.0:** the plugin reports a pip of 1, and Zorro prints prices to the pip's precision, so a kPEPE entry logs as e.g. `Long 4000@0.0`. Only the display is affected: the plugin's own `BrokerBuy2`/`BrokerSell2` lines show the real price, and profit is computed from it.
 - **`SET_LEVERAGE` with no `SET_SYMBOL` right before it waits for the next order:** Zorro sends `SET_LEVERAGE` by itself before every order, without naming the asset, so the plugin holds it and sets it on the asset of the next order (an entry is not placed if that leverage is refused; a close goes ahead). Right after a `SET_SYMBOL` it is set on that asset at once, and the `SET_SYMBOL` is used up. Until the next order, `BrokerAsset` still reports margin at the old leverage.

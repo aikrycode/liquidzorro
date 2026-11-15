@@ -59,9 +59,42 @@ pub fn login(privkey: Option<&str>, base_url: BaseUrl) -> Result<alloy::primitiv
 }
 
 /// `Amount` is a plain C `int`, so it can't hold a fraction of a base-asset
-/// unit (e.g. BTC). Instead it counts `1/AMOUNT_SCALE`-sized sub-units; the
-/// Zorro script mirrors this via its own AMOUNT_SCALE constant.
+/// unit (e.g. BTC). Instead it counts lots: `1/AMOUNT_SCALE` of a coin for
+/// assets traded in fractions, one coin for those traded only in whole
+/// coins (`AssetInfo::lot_size`). Scripts read it as Zorro's `LotAmount`.
 pub const AMOUNT_SCALE: f64 = 100_000.0;
+
+/// Coins in one Zorro lot of `symbol`.
+pub fn lot_size(symbol: &str) -> Result<f64, String> {
+    let plugin = state::get().ok_or("not logged in")?;
+    let asset = runtime::get().block_on(resolve_asset(&plugin.info_client, symbol))?;
+    Ok(asset.lot_size())
+}
+
+/// A size in coins as a Zorro lot count.
+fn to_lots(sz: f64, lot: f64) -> i32 {
+    (sz / lot).round() as i32
+}
+
+/// Checks the LotAmount Zorro sent (SET_AMOUNT) against the plugin's lot
+/// for `symbol`. They must agree: Zorro sizes orders in lots of LotAmount
+/// and the plugin reads them as lots of its own, so a mismatch scales the
+/// order -- by 100,000 between the two sizes in use.
+pub fn check_lot_amount(symbol: &str, lot_amount: f64) -> Result<(), String> {
+    let lot = lot_size(symbol)?;
+    lot_amount_matches(lot_amount, lot).then_some(()).ok_or_else(|| {
+        format!(
+            "the asset list has LotAmount {lot_amount} for {symbol}, but one lot of it is {lot} coins: \
+set LotAmount {lot} in the asset list"
+        )
+    })
+}
+
+/// Zorro keeps LotAmount at float precision, so 0.00001 arrives as
+/// 0.0000099999997.
+fn lot_amount_matches(lot_amount: f64, lot: f64) -> bool {
+    (lot_amount / lot - 1.0).abs() < 1e-4
+}
 
 /// Zorro's SET_ORDERTYPE value for a good-till-cancelled (resting) order.
 pub const ORDER_TYPE_GTC: i32 = 2;
@@ -128,7 +161,7 @@ mod tif_tests {
 /// units. Above zero it rests a stop on the exchange once the entry fills,
 /// so the position stays protected even with Zorro shut down.
 ///
-/// Returns `(zorro_trade_id, fill_price, fill_amount)` in `AMOUNT_SCALE` units.
+/// Returns `(zorro_trade_id, fill_price, fill_amount)`, the fill in lots.
 pub fn place_order(
     symbol: &str,
     amount: i32,
@@ -141,7 +174,8 @@ pub fn place_order(
         return Err("amount must be nonzero".to_string());
     }
     let is_buy = amount > 0;
-    let raw_sz = amount.unsigned_abs() as f64 / AMOUNT_SCALE;
+    let lot = lot_size(symbol)?;
+    let raw_sz = amount.unsigned_abs() as f64 * lot;
 
     // Closes never go out as a TWAP: they fall through and fill now.
     if twap::minutes() > 0 && !closing {
@@ -275,7 +309,7 @@ filled, and Zorro only keeps polling a GTC order, so it would never see the slic
                     }
                 }
             }
-            Ok((zorro_id, price, (fill_sz * AMOUNT_SCALE).round() as i32))
+            Ok((zorro_id, price, to_lots(fill_sz, lot)))
         }
         // Resting: accepted but unfilled. Zorro reads fill 0 as a pending
         // trade and polls BrokerTrade until it fills or it cancels it.
@@ -348,7 +382,7 @@ pub fn modify_order(zorro_id: i32, new_limit: f64, new_amount: i32) -> Result<i3
 
         let asset = resolve_asset(&plugin.info_client, &info.coin).await?;
         let sz = if new_amount > 0 {
-            assets::round_size(new_amount as f64 / AMOUNT_SCALE, asset.sz_decimals)
+            assets::round_size(new_amount as f64 * info.lot, asset.sz_decimals)
         } else {
             info.entry_sz
         };
@@ -410,7 +444,7 @@ pub fn modify_order(zorro_id: i32, new_limit: f64, new_amount: i32) -> Result<i3
         ExchangeDataStatus::Filled(order) => {
             let price = order.avg_px.parse().unwrap_or(limit_px);
             state::set_resting(zorro_id, order.oid, price, sz);
-            Ok((sz * AMOUNT_SCALE).round() as i32)
+            Ok(to_lots(sz, info.lot))
         }
         // The original was cancelled before the replacement was refused.
         // Say so: a script that believes it still has an order working
@@ -699,10 +733,10 @@ pub fn close_trade(trade_id: i32, amount: i32, limit: f64) -> Result<CloseOutcom
         if info.remaining_sz <= 0.0 {
             return Err("the TWAP filled nothing; it is stopped and there is nothing to close".to_string());
         }
-        amount = amount.signum() * (info.remaining_sz * AMOUNT_SCALE).round() as i32;
+        amount = amount.signum() * to_lots(info.remaining_sz, info.lot);
     }
     let symbol = info.coin.clone();
-    let requested = amount.unsigned_abs() as f64 / AMOUNT_SCALE;
+    let requested = amount.unsigned_abs() as f64 * info.lot;
     let closes_whole_trade = requested >= info.remaining_sz - 1e-9;
 
     let plan = spot_close_plan(&symbol, requested, closes_whole_trade, limit)?;
@@ -710,7 +744,7 @@ pub fn close_trade(trade_id: i32, amount: i32, limit: f64) -> Result<CloseOutcom
         // A perp: reduce-only takes care of oversized closes.
         None => place_order(&symbol, -amount, limit, true, 0.0)?,
         Some(SpotClose::Sell(sz)) => {
-            place_order(&symbol, -((sz * AMOUNT_SCALE).round() as i32), limit, true, 0.0)?
+            place_order(&symbol, -to_lots(*sz, info.lot), limit, true, 0.0)?
         }
         Some(SpotClose::Unsellable { price, reason }) => {
             if !closes_whole_trade {
@@ -720,7 +754,7 @@ pub fn close_trade(trade_id: i32, amount: i32, limit: f64) -> Result<CloseOutcom
         }
     };
 
-    let closed_qty = fill.unsigned_abs() as f64 / AMOUNT_SCALE;
+    let closed_qty = fill.unsigned_abs() as f64 * info.lot;
     let direction = if info.is_buy { 1.0 } else { -1.0 };
     let mut profit = direction * (price - info.entry_price) * closed_qty;
 
@@ -1068,7 +1102,7 @@ pub fn trade_status(zorro_id: i32) -> Option<(f64, f64, f64, f64, i32)> {
     let close_price = asset_price(&info.coin).unwrap_or(info.entry_price);
     let direction = if info.is_buy { 1.0 } else { -1.0 };
 
-    // fill_state is in AMOUNT_SCALE sub-units, like BrokerBuy2's fill_amount.
+    // fill_state is in lots, like BrokerBuy2's fill_amount.
     // filled_sz drives profit: an order still resting has none, so it must
     // not accrue P&L just because the market moved away from its limit.
     let (fill_state, filled_sz) = match order_state.as_deref() {
@@ -1086,7 +1120,7 @@ pub fn trade_status(zorro_id: i32) -> Option<(f64, f64, f64, f64, i32)> {
         Some(_) => {
             let remaining = open_sz.unwrap_or(info.entry_sz);
             let filled = (info.entry_sz - remaining - info.entry_fee_in_coin).max(0.0);
-            ((filled * AMOUNT_SCALE).round() as i32, filled)
+            (to_lots(filled, info.lot), filled)
         }
     };
     let profit = direction * (close_price - info.entry_price) * filled_sz;
@@ -1114,7 +1148,7 @@ fn last_known_fill(info: &state::TradeInfo) -> (i32, f64) {
     if info.pending {
         (0, 0.0)
     } else {
-        ((info.remaining_sz * AMOUNT_SCALE).round() as i32, info.remaining_sz)
+        (to_lots(info.remaining_sz, info.lot), info.remaining_sz)
     }
 }
 
@@ -1134,6 +1168,7 @@ mod unknown_order_tests {
             entry_fee: 0.0,
             entry_fee_final: false,
             entry_fee_in_coin: 0.0,
+            lot: state::DEFAULT_LOT,
             close_fees: 0.0,
             stop_oid: None,
             pending,
@@ -1369,13 +1404,14 @@ pub fn net_position(symbol: &str) -> Option<f64> {
 /// Margin a single lot ties up, for `BrokerAsset`. Spot posts the full
 /// notional; a perp posts notional divided by its leverage.
 pub fn margin_cost_per_lot(symbol: &str, price: f64) -> f64 {
-    let notional_per_lot = price / AMOUNT_SCALE;
+    let default = price * state::DEFAULT_LOT;
     let Some(plugin) = state::get() else {
-        return notional_per_lot;
+        return default;
     };
     let Ok(asset) = runtime::get().block_on(resolve_asset(&plugin.info_client, symbol)) else {
-        return notional_per_lot;
+        return default;
     };
+    let notional_per_lot = price * asset.lot_size();
     if !asset.is_perp() {
         return notional_per_lot;
     }
@@ -1476,15 +1512,15 @@ pub fn apply_leverage_request(symbol: &str) -> Result<Option<u32>, String> {
 /// hourly and a positive one means longs pay shorts, so a long's roll is
 /// the negated daily rate times the notional of one lot.
 pub fn rollover_per_lot(symbol: &str) -> (f64, f64) {
-    match perp_funding(symbol) {
-        Some((rate, oracle)) => roll_per_lot(rate, oracle),
-        None => (0.0, 0.0),
+    match (perp_funding(symbol), lot_size(symbol)) {
+        (Some((rate, oracle)), Ok(lot)) => roll_per_lot(rate, oracle, lot),
+        _ => (0.0, 0.0),
     }
 }
 
 /// The sign and scale rule of `rollover_per_lot`, apart from the network.
-fn roll_per_lot(hourly_rate: f64, oracle_px: f64) -> (f64, f64) {
-    let daily = hourly_rate * 24.0 * oracle_px / AMOUNT_SCALE;
+fn roll_per_lot(hourly_rate: f64, oracle_px: f64, lot: f64) -> (f64, f64) {
+    let daily = hourly_rate * 24.0 * oracle_px * lot;
     (-daily, daily)
 }
 
@@ -1516,13 +1552,25 @@ fn perp_funding(symbol: &str) -> Option<(f64, f64)> {
 
 #[cfg(test)]
 mod roll_tests {
-    use super::{roll_per_lot, AMOUNT_SCALE};
+    use super::{lot_amount_matches, roll_per_lot, AMOUNT_SCALE};
+
+    /// Zorro sends LotAmount at float precision; that must still match,
+    /// and the other lot size must not.
+    #[test]
+    fn a_lot_amount_matches_at_float_precision_only() {
+        let fine = 1.0 / AMOUNT_SCALE;
+        assert!(lot_amount_matches(0.000009999999747378752, fine));
+        assert!(lot_amount_matches(1.0, 1.0));
+        assert!(!lot_amount_matches(1.0, fine));
+        assert!(!lot_amount_matches(fine, 1.0));
+        assert!(!lot_amount_matches(0.0001, fine));
+    }
 
     /// ETH at $2,000 with 0.00125% an hour: a coin costs a long $0.60 a
     /// day, and a lot is 1/AMOUNT_SCALE of a coin.
     #[test]
     fn a_positive_rate_charges_longs_and_pays_shorts() {
-        let (long, short) = roll_per_lot(0.0000125, 2000.0);
+        let (long, short) = roll_per_lot(0.0000125, 2000.0, 1.0 / AMOUNT_SCALE);
         let per_coin = 0.6;
         assert!((long + per_coin / AMOUNT_SCALE).abs() < 1e-15, "got {long}");
         assert!((short - per_coin / AMOUNT_SCALE).abs() < 1e-15, "got {short}");
@@ -1530,13 +1578,13 @@ mod roll_tests {
 
     #[test]
     fn a_negative_rate_pays_longs() {
-        let (long, short) = roll_per_lot(-0.00001, 3000.0);
+        let (long, short) = roll_per_lot(-0.00001, 3000.0, 1.0 / AMOUNT_SCALE);
         assert!(long > 0.0 && short < 0.0);
     }
 
     #[test]
     fn no_rate_no_roll() {
-        assert_eq!(roll_per_lot(0.0, 2000.0), (-0.0, 0.0));
+        assert_eq!(roll_per_lot(0.0, 2000.0, 1.0 / AMOUNT_SCALE), (-0.0, 0.0));
     }
 }
 

@@ -36,7 +36,10 @@
 #define CYCLES          2            // market round trips
 #define HISTORY_BARS    50           // candles to pull via BrokerHistory2
 
-#define AMOUNT_SCALE    100000.
+// Lots per coin of the current asset, from the asset list's LotAmount:
+// 100000 for assets traded in fractions, 1 for those traded only in whole
+// coins. The plugin refuses an entry whose LotAmount does not match.
+#define AMOUNT_SCALE    (1./LotAmount)
 // One exchange size step for HL_SYMBOL: FTEST has szDecimals 2, so it
 // trades in 0.01 coins, which is 1000 lots. Less than this cannot be sold
 // at all, so it is the floor a close can reach, not a tolerance.

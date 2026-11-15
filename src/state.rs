@@ -40,6 +40,9 @@ pub struct TradeInfo {
     /// already taken off the size. A spot buy receives that much less than
     /// it filled, so the size Zorro tracks must not include it.
     pub entry_fee_in_coin: f64,
+    /// Coins in one Zorro lot for this asset (`AssetInfo::lot_size`), kept
+    /// so every later poll and close converts the same way.
+    pub lot: f64,
     /// Fees of the closes booked against this trade so far. Kept apart from
     /// `entry_fee` so retrying the entry lookup cannot overwrite them.
     pub close_fees: f64,
@@ -162,6 +165,17 @@ pub fn take_leverage_request() -> Option<u32> {
     LEVERAGE_REQUEST.lock().unwrap_or_else(|e| e.into_inner()).take()
 }
 
+// The LotAmount Zorro sent with SET_AMOUNT, held for the next order.
+static LOT_AMOUNT: Mutex<Option<f64>> = Mutex::new(None);
+
+pub fn set_lot_amount(lot_amount: f64) {
+    *LOT_AMOUNT.lock().unwrap_or_else(|e| e.into_inner()) = Some(lot_amount);
+}
+
+pub fn take_lot_amount() -> Option<f64> {
+    LOT_AMOUNT.lock().unwrap_or_else(|e| e.into_inner()).take()
+}
+
 struct Callbacks {
     error: Option<ErrorFn>,
     #[allow(dead_code)] // wired up once long-running calls report progress
@@ -233,6 +247,8 @@ pub fn register_trade(coin: &str, oid: u64, is_buy: bool, entry_price: f64, entr
                 entry_fee: 0.0,
                 entry_fee_final: false,
                 entry_fee_in_coin: 0.0,
+                // the order was built against the resolved asset, so it is cached
+                lot: cached_asset(coin).map_or(DEFAULT_LOT, |a| a.lot_size()),
                 close_fees: 0.0,
                 stop_oid: None,
                 pending: false,
@@ -243,6 +259,10 @@ pub fn register_trade(coin: &str, oid: u64, is_buy: bool, entry_price: f64, entr
     }
     id
 }
+
+/// Coins in a lot when the asset is not known; what every asset used before
+/// whole-coin assets got their own.
+pub const DEFAULT_LOT: f64 = 1.0 / crate::bridge::AMOUNT_SCALE;
 
 /// Points a trade at its order as it now stands after a modify: possibly a
 /// new order id, a new limit price and a new size, nothing filled yet.

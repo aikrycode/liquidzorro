@@ -21,13 +21,19 @@
 // Priced only, to prove mixed universes. Not HYPE/USDC: its testnet book
 // has quoted 756 / 2267, a spread no live-book check should accept.
 #define SPOT_SYMBOL     "FTEST/USDC"
+// Traded only in whole coins, priced under a cent: LotAmount 1, so $15 of
+// it is a few thousand lots instead of hundreds of millions.
+#define WHOLE_SYMBOL    "kPEPE-PERP" // Hyperliquid symbol "kPEPE"
 #define MIN_BALANCE     750          // hard floor; abort rather than spend past this
 #define TRADE_USD       15           // notional per position; must clear $10
 #define LIMIT_USD       15           // resting limit order notional
 #define MAX_LEVERAGE    1            // unleveraged: no liquidation risk
 #define HISTORY_BARS    50
 
-#define AMOUNT_SCALE    100000.
+// Lots per coin of the current asset, from the asset list's LotAmount:
+// 100000 for assets traded in fractions, 1 for those traded only in whole
+// coins. The plugin refuses an entry whose LotAmount does not match.
+#define AMOUNT_SCALE    (1./LotAmount)
 // Dust has to be a cash amount, not a lot count: 1000 lots is $1.58 of HYPE
 // but $23 of ETH, which would swallow an entire test position.
 #define DUST_USD        1.0
@@ -87,6 +93,10 @@
 #define PH_TWAP_FLAT    26
 #define PH_TWAP_STILL   27
 #define PH_DEADMAN      28
+#define PH_WHOLE_OPEN   29
+#define PH_WHOLE_CHECK  30
+#define PH_WHOLE_FLAT   31
+#define PH_LOT_MISMATCH 32
 
 int Phase;
 int Passed, Failed;
@@ -98,6 +108,8 @@ int LimitPollsLeft;
 int TwapPollsLeft;
 int LimitCancelled;
 int FlattenTriesLeft;
+var WholeLots;
+int WholeTriesLeft;
 
 void check(string Name, int Ok)
 {
@@ -184,7 +196,8 @@ function run()
 
 	if(is(INITRUN)) {
 		assetList("AssetsHyperliquid");
-		asset(SPOT_SYMBOL);      // register both so their price series load
+		asset(SPOT_SYMBOL);      // register them all so their price series load
+		asset(WHOLE_SYMBOL);
 		Phase = PH_PREFLIGHT;
 		Passed = 0;
 		Failed = 0;
@@ -621,6 +634,79 @@ Position a minute later: %.0f lots", Held);
 		check("SET_DEADMAN arms, or is refused cleanly", Result == 60 || Result == -1);
 		Result = brokerCommand(CMD_SET_DEADMAN, 0);
 		check("SET_DEADMAN switches off", Result == 0);
+		Phase = PH_WHOLE_OPEN;
+		return;
+	}
+
+	///////////////////////////////////////////////////////////////////////
+	// A perp traded only in whole coins: one lot is one coin, so a cheap
+	// coin's order fits Zorro's 32-bit lot count.
+	///////////////////////////////////////////////////////////////////////
+	if(Phase == PH_WHOLE_OPEN) {
+		asset(WHOLE_SYMBOL);
+		if(priceClose(0) <= 0) return;
+		if(!budgetOk()) { Phase = PH_REPORT; return; }
+		printf("\n--- whole-coin perp ---");
+		check("A whole-coin perp has LotAmount 1", LotAmount == 1);
+		brokerCommand(CMD_SET_ORDERTYPE, ORDERTYPE_IOC);
+		OrderLimit = 0;
+		WholeLots = lotsFor(TRADE_USD);
+		Lots = WholeLots;
+		enterLong();
+		printf("\n%s long submitted: %.0f lots (~$%d)", WHOLE_SYMBOL, WholeLots, TRADE_USD);
+		Phase = PH_WHOLE_CHECK;
+		return;
+	}
+
+	if(Phase == PH_WHOLE_CHECK) {
+		var Held, Booked = 0;
+		asset(WHOLE_SYMBOL);
+		Held = heldLots();
+		for(open_trades) if(strstr(Asset, "kPEPE")) Booked += TradeLots;
+		asset(WHOLE_SYMBOL);   // the trade loop may leave another asset selected
+		printf("\n%s held %.0f lots, Zorro books %.0f", WHOLE_SYMBOL, Held, Booked);
+		check("A whole-coin perp is held in lots of one coin", Held == WholeLots);
+		check("Zorro books the whole-coin trade at the size held", Booked == Held);
+		exitLong();
+		WholeTriesLeft = 3;
+		Phase = PH_WHOLE_FLAT;
+		return;
+	}
+
+	if(Phase == PH_WHOLE_FLAT) {
+		var Held;
+		asset(WHOLE_SYMBOL);
+		Held = heldLots();
+		if(Held != 0 && --WholeTriesLeft > 0) {
+			printf("\nClosing %s residual: %.0f lots", WHOLE_SYMBOL, Held);
+			exitLong();
+			return;
+		}
+		check("The whole-coin perp closes flat", Held == 0);
+		Phase = PH_LOT_MISMATCH;
+		return;
+	}
+
+	///////////////////////////////////////////////////////////////////////
+	// An asset list whose LotAmount disagrees with the plugin's lot would
+	// scale every order. Here ETH is told one lot is one coin while the
+	// plugin counts 0.00001: the plugin must refuse the entry. Were it
+	// placed anyway it would be $15, which PH_FLATTEN closes.
+	///////////////////////////////////////////////////////////////////////
+	if(Phase == PH_LOT_MISMATCH) {
+		var Price, Saved;
+		TRADE* T;
+		Price = priceClose(0);
+		Saved = LotAmount;
+		if(Price <= 0) return;
+		printf("\n--- LotAmount mismatch ---");
+		brokerCommand(CMD_SET_ORDERTYPE, ORDERTYPE_IOC);
+		OrderLimit = 0;
+		LotAmount = 1;
+		Lots = ceil(TRADE_USD/Price*100000);
+		T = enterLong();
+		LotAmount = Saved;
+		check("An entry with a mismatched LotAmount is refused", T == 0);
 		Phase = PH_REJECT;
 		return;
 	}

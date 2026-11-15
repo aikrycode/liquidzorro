@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use serde::Serialize;
 use serde_json::Value;
 
-use super::{asset_price, resolve_asset, AMOUNT_SCALE};
+use super::{asset_price, resolve_asset, to_lots};
 use crate::assets;
 use crate::ffi::NAY;
 use crate::{l1, runtime, state};
@@ -195,7 +195,7 @@ pub fn status(zorro_id: i32, info: &state::TradeInfo) -> Option<(f64, f64, f64, 
     let direction = if info.is_buy { 1.0 } else { -1.0 };
     let profit = direction * (close_price - info.entry_price) * info.remaining_sz;
     let cost = -(info.total_fees() + super::trade_funding(&info.coin, info.remaining_sz));
-    let fill_state = (info.remaining_sz * AMOUNT_SCALE).round() as i32;
+    let fill_state = to_lots(info.remaining_sz, info.lot);
     Some((info.entry_price, close_price, cost, profit, fill_state))
 }
 

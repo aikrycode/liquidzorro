@@ -41,6 +41,23 @@ impl AssetInfo {
         };
         max_decimals.saturating_sub(self.sz_decimals)
     }
+
+    /// Coins in one Zorro lot. Zorro counts an order in lots with a 32-bit
+    /// int, so the lot has to be small enough for fine sizes and large
+    /// enough that a cheap coin's order still fits. An asset traded in
+    /// fractions gets 1/AMOUNT_SCALE of a coin (21,474 coins at most per
+    /// order); one traded only in whole coins -- every coin priced under a
+    /// cent, at the time of writing -- gets one coin, since a smaller lot
+    /// buys no precision there and $60 of it can be millions of coins.
+    /// Must match the asset list's LotAmount, which Zorro sends before
+    /// every order (SET_AMOUNT) and the plugin checks.
+    pub fn lot_size(&self) -> f64 {
+        if self.sz_decimals == 0 {
+            1.0
+        } else {
+            1.0 / crate::bridge::AMOUNT_SCALE
+        }
+    }
 }
 
 /// Looks `symbol` up in the perp universe first, then spot. Perp names are
@@ -225,6 +242,20 @@ mod tests {
         let margin_cost = price / crate::bridge::AMOUNT_SCALE; // what BrokerAsset reports
         let leverage = price / margin_cost * (pip_cost / pip);
         assert!((leverage - 1.0).abs() < 1e-9, "expected 1x, got {leverage}");
+    }
+
+    /// Whole-coin assets count lots in coins, so a cheap coin's order fits
+    /// Zorro's 32-bit lot count; the rest keep the fine default.
+    #[test]
+    fn a_whole_coin_asset_counts_lots_in_coins() {
+        assert_eq!(perp(0).lot_size(), 1.0);
+        assert_eq!(spot(0).lot_size(), 1.0);
+        assert_eq!(perp(4).lot_size(), 0.00001);
+        assert_eq!(spot(2).lot_size(), 0.00001);
+        // $60 of a coin at $0.00014: about 430,000 coins
+        let coins = 60.0 / 0.00014;
+        assert!(coins / perp(0).lot_size() < i32::MAX as f64);
+        assert!(coins / perp(4).lot_size() > i32::MAX as f64, "what overflowed before");
     }
 
     #[test]

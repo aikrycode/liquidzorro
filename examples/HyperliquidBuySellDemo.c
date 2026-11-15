@@ -6,9 +6,10 @@
 #define USD_AMOUNT        25            // USDC notional to buy
 
 // Amount is a plain C int, can't hold a fraction of a base-asset unit, so
-// 1 Lot = 1/AMOUNT_SCALE of one unit. Must match bridge::AMOUNT_SCALE and
-// AssetsHyperliquid.csv's LotAmount column.
-#define AMOUNT_SCALE      100000.
+// 1 Lot = LotAmount of one unit: 0.00001 for assets traded in fractions, 1
+// for those traded only in whole coins (AssetsHyperliquid.csv). The plugin
+// refuses an entry whose LotAmount does not match its own.
+#define AMOUNT_SCALE      (1./LotAmount)
 
 // Below this, a leftover position is too small to reliably sell (rounds to
 // zero at the asset's real size precision and gets rejected) -- ignore it

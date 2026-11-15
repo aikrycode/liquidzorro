@@ -31,6 +31,8 @@ const COARSE_SPOT: &str = "PURR/USDC";
 /// Perp the tests trade: liquid on testnet, with `sz_decimals` fine enough
 /// to reach the $10 minimum.
 const TEST_PERP: &str = "ETH";
+/// A perp traded only in whole coins (szDecimals 0), priced under a cent.
+const WHOLE_COIN_PERP: &str = "kPEPE";
 
 /// Diagnostic: prints every spot pair on whichever network
 /// `HL_TESTNET_PRIVKEY` points at. Use it to find the index of a pair that
@@ -372,14 +374,48 @@ fn opens_and_closes_a_perp_short() {
     println!("net position while short: {shorted}");
     assert!(shorted < 0.0, "a short must report a NEGATIVE position, got {shorted}");
 
-    // closing=true -> reduce_only, so an oversized close flattens, never flips
+    // closing=true -> reduce_only, so an oversized close flattens, never
+    // flips. Close what filled: the order was rounded to the size step, and
+    // closing the unrounded request left a step open.
     let (close_id, close_px, close_fill) =
-        place_order(TEST_PERP, units, 0.0, true, 0.0).expect("short should close");
+        place_order(TEST_PERP, fill, 0.0, true, 0.0).expect("short should close");
     println!("short closed: {close_fill} @ {close_px}, trade id {close_id}");
 
     let after = net_position(TEST_PERP).expect("net_position after close");
     println!("net position after close: {after}");
-    assert!(after.abs() < qty * 0.5, "position should be ~flat, got {after}");
+    assert!(after.abs() < 1e-9, "position should be flat, got {after}");
+}
+
+/// A perp traded only in whole coins counts its lots in coins: an order
+/// for a cheap coin would otherwise need more lots than Zorro's 32-bit
+/// count holds. Opens the minimum long and closes it; costs cents.
+#[test]
+#[ignore]
+fn trades_a_whole_coin_perp_in_lots_of_one_coin() {
+    login(None, BaseUrl::Testnet).expect("login should succeed");
+    set_leverage(WHOLE_COIN_PERP, 1).expect("1x leverage");
+    state::set_order_type(1); // IOC
+    assert_eq!(lot_size(WHOLE_COIN_PERP), Ok(1.0));
+    assert!(check_lot_amount(WHOLE_COIN_PERP, 1.0).is_ok());
+    let refused = check_lot_amount(WHOLE_COIN_PERP, 0.00001).unwrap_err();
+    println!("{refused}");
+    assert!(refused.contains("set LotAmount 1"));
+
+    let price = asset_price(WHOLE_COIN_PERP).expect("price");
+    let coins = minimum_qty(price).ceil();
+    let (id, fill_px, fill) =
+        place_order(WHOLE_COIN_PERP, coins as i32, 0.0, false, 0.0).expect("long should open");
+    println!("{WHOLE_COIN_PERP}: {fill} lots @ {fill_px} for {coins} coins");
+    assert_eq!(fill as f64, coins, "one lot is one coin");
+    let held = net_position(WHOLE_COIN_PERP).expect("position");
+    assert!((held - coins).abs() < 1e-9, "holding {held}");
+    let (.., status) = trade_status(id).expect("status");
+    assert_eq!(status, fill);
+
+    let outcome = close_trade(id, fill, 0.0).expect("close");
+    assert_eq!(outcome.remaining, 0.0);
+    let after = net_position(WHOLE_COIN_PERP).expect("position");
+    assert!(after.abs() < 1e-9, "left {after}");
 }
 
 /// reduce_only must stop a close from overshooting into an opposing
@@ -617,15 +653,21 @@ fn a_spot_trade_closes_whole_and_retires_what_cannot_be_sold() {
     let price = asset_price(&pair).expect("price");
     // Whole coins, so the net (minus the fee) still floors to 3 = over $10.
     let coins = (15.0 / price).ceil();
-    let amount = (coins * AMOUNT_SCALE).round() as i32;
+    // PURR trades in whole coins, so one lot is one coin.
+    let lot = lot_size(&pair).expect("lot");
+    assert_eq!(lot, 1.0);
+    let amount = (coins / lot).round() as i32;
 
     let (id, _, fill) = place_order(&pair, amount, 0.0, false, 0.0).expect("buy should fill");
     let trade = state::get_trade(id).expect("trade");
     println!("bought {coins} {pair}: Zorro told {fill} lots, entry fee {} USDC", trade.entry_fee);
-    assert!(fill < amount, "fill {fill} should be net of the fee taken in {pair}'s coin");
-    assert!(fill > amount * 99 / 100, "fill {fill} lost far more than a fee");
+    // The fee is a fraction of a coin: the trade holds less than it
+    // bought, but in whole-coin lots Zorro is told the rounded size.
+    let fee_in_coins = trade.entry_fee_in_coin;
+    assert!(fee_in_coins > 0.0, "the fee must be taken in {pair}'s coin");
+    assert!(trade.remaining_sz < coins && trade.remaining_sz > coins * 0.99);
+    assert_eq!(fill, to_lots(trade.remaining_sz, lot));
     // 0.07% of ~$18 is ~$0.013; the same number read as coins would be ~0.003.
-    let fee_in_coins = (amount - fill) as f64 / AMOUNT_SCALE;
     assert!(
         trade.entry_fee > fee_in_coins * price * 0.9,
         "entry fee {} was booked in coins, not USDC ({fee_in_coins} coins)",
@@ -650,7 +692,7 @@ fn a_spot_trade_closes_whole_and_retires_what_cannot_be_sold() {
     // The sold coins earn the price move; the unsellable sliver earns
     // minus its cost. Booked at market instead, it hid about a coin's worth a cycle.
     let sold = (coins - 1.0).max(0.0);
-    let sliver = fill as f64 / AMOUNT_SCALE - sold;
+    let sliver = trade.remaining_sz - sold;
     let expected = (outcome.price - trade.entry_price) * sold - trade.entry_price * sliver;
     println!("profit told to Zorro {:.4}, expected {expected:.4} ({sliver} lost)", outcome.profit);
     assert!(sliver > 0.0 && sliver < 1.0, "sliver {sliver} should be under one coin");

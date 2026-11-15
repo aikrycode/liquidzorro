@@ -96,9 +96,10 @@ pub unsafe extern "C" fn BrokerLogin(
                 state::log_message(&format!("Hyperliquid: dead-man's switch not cleared at logout: {e}"));
             }
             bridge::forget_deadman();
-            // a SET_SYMBOL scope or held SET_LEVERAGE is this session's only
+            // a SET_SYMBOL scope or held SET_LEVERAGE/SET_AMOUNT is this session's only
             state::take_symbol();
             state::take_leverage_request();
+            state::take_lot_amount();
             state::clear();
             state::log_message("Hyperliquid: logged out");
             return 1;
@@ -175,6 +176,13 @@ pub unsafe extern "C" fn BrokerAsset(
             state::log_message(&format!("BrokerAsset({symbol}): price unavailable"));
             return 0;
         };
+        let lot = match bridge::lot_size(symbol) {
+            Ok(lot) => lot,
+            Err(e) => {
+                state::log_message(&format!("BrokerAsset({symbol}): {e}"));
+                return 0;
+            }
+        };
 
         if !p_price.is_null() {
             *p_price = price;
@@ -191,11 +199,11 @@ pub unsafe extern "C" fn BrokerAsset(
         }
         if !p_pip_cost.is_null() {
             // Value of one pip per lot. Zorro computes profit as
-            // priceDiff * Lots * PipCost / Pip, and a lot is 1/AMOUNT_SCALE
-            // of a coin, so the ratio has to equal that lot size. It also
-            // feeds Leverage = price / MarginCost * PipCost / Pip, which
-            // Zorro sends straight back via SET_LEVERAGE.
-            *p_pip_cost = 1.0 / bridge::AMOUNT_SCALE;
+            // priceDiff * Lots * PipCost / Pip, so with Pip 1 this is the
+            // lot size in coins. It also feeds Leverage = price /
+            // MarginCost * PipCost / Pip, which Zorro sends straight back
+            // via SET_LEVERAGE.
+            *p_pip_cost = lot;
         }
         if !p_min_amount.is_null() {
             *p_min_amount = 0.0;
@@ -313,6 +321,18 @@ pub unsafe extern "C" fn BrokerBuy2(
             (true, true) => "close short",
             (false, true) => "close long",
         };
+        // Zorro sized this order in lots of its LotAmount. An entry that
+        // disagrees with the plugin's lot would go out scaled, so it is not
+        // placed; a close is sized from the trade, so it goes ahead.
+        if let Some(lot_amount) = state::take_lot_amount() {
+            if let Err(e) = bridge::check_lot_amount(symbol, lot_amount) {
+                if !closing {
+                    state::log_message(&format!("BrokerBuy2: {side} {symbol} FAILED: {e}"));
+                    return 0;
+                }
+                state::log_message(&format!("BrokerBuy2: {e}; closing anyway"));
+            }
+        }
         // A SET_LEVERAGE with no SET_SYMBOL is meant for this order's asset.
         // An entry at a leverage that could not be set is not placed; a
         // close goes ahead, since it only frees margin.
@@ -427,7 +447,7 @@ const GET_COMPLIANCE: c_int = 51;
 
 /// GET_POSITION: real held balance for the symbol in `parameter` (`char*`),
 /// read from Hyperliquid directly rather than Zorro's local (process-only)
-/// trade bookkeeping -- survives a full restart. AMOUNT_SCALE sub-units.
+/// trade bookkeeping -- survives a full restart. In lots of the asset.
 const GET_POSITION: c_int = 53;
 
 /// GET_BROKERZONE: time zone of the broker's timestamps. `0` = UTC, which
@@ -475,6 +495,11 @@ const SET_TWAP: c_int = 2002;
 /// traded $1,000,000.
 const SET_DEADMAN: c_int = 2003;
 
+/// SET_AMOUNT: the asset's LotAmount, passed by address. Zorro sends it
+/// before every order; the plugin refuses an entry whose LotAmount does not
+/// match its own lot for the asset (see `AssetInfo::lot_size`).
+const SET_AMOUNT: c_int = 139;
+
 /// SET_SYMBOL: the asset subsequent commands apply to.
 const SET_SYMBOL: c_int = 132;
 
@@ -516,6 +541,20 @@ pub unsafe extern "C" fn BrokerCommand(command: c_int, parameter: isize) -> f64 
                 -1.0
             }
         },
+        SET_AMOUNT => {
+            // Zorro passes the address of the asset's LotAmount.
+            let ptr = parameter as *const f64;
+            if ptr.is_null() {
+                return 0.0;
+            }
+            let lot_amount = unsafe { ptr.read_unaligned() };
+            if !(lot_amount.is_finite() && lot_amount > 0.0) {
+                state::log_message(&format!("BrokerCommand(SET_AMOUNT): {lot_amount} is not a lot amount"));
+                return 0.0;
+            }
+            state::set_lot_amount(lot_amount);
+            1.0
+        }
         SET_SYMBOL => match read_cstr(parameter as *const c_char) {
             Some(symbol) => {
                 state::set_symbol(symbol);
@@ -597,9 +636,9 @@ pub unsafe extern "C" fn BrokerCommand(command: c_int, parameter: isize) -> f64 
             let Some(symbol) = read_cstr(parameter as *const c_char) else {
                 return 0.0;
             };
-            match bridge::net_position(symbol) {
-                Some(qty) => qty * bridge::AMOUNT_SCALE,
-                None => {
+            match (bridge::net_position(symbol), bridge::lot_size(symbol)) {
+                (Some(qty), Ok(lot)) => qty / lot,
+                _ => {
                     state::log_message(&format!(
                         "BrokerCommand(GET_POSITION, {symbol}): unavailable (not logged in?)"
                     ));
