@@ -334,6 +334,11 @@ function run()
 		// P&L is gross and the plugin is not reporting what it cost.
 		printf("\nCost booked by Zorro: %.4f", Cost);
 		check("Fees reach Zorro as a trade cost", Cost < 0);
+		// Both sides pay a taker fee of about 0.045%. A close fee read
+		// before the exchange had indexed it used to be booked as zero,
+		// leaving only the entry's.
+		check("Zorro books the close fee as well as the entry fee",
+			Cost <= -2*0.0004*TRADE_USD);
 		Phase = PH_OPEN_SHORT;
 		return;
 	}

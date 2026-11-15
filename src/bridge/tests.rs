@@ -527,40 +527,45 @@ fn margin_reflects_leverage_while_flat() {
 
 /// A round trip must report what it actually cost. pProfit is gross by
 /// contract, so a fee of zero here means Zorro's P&L silently overstates
-/// every trade by the exchange's cut.
+/// every trade by the exchange's cut. Three in a row, because the fills
+/// feed can lag the fill: a close fee read once was then lost now and
+/// again. Costs a few cents.
 #[test]
 #[ignore]
 fn a_round_trip_reports_the_fees_it_paid() {
     login(None, BaseUrl::Testnet).expect("login should succeed");
-    let price = asset_price(TEST_PERP).expect("perp price");
-    let qty = minimum_qty(price);
-    let amount = (qty * AMOUNT_SCALE).round() as i32;
-
     set_leverage(TEST_PERP, 1).expect("1x");
-    let (id, _, fill) = place_order(TEST_PERP, amount, 0.0, false, 0.0).expect("open should fill");
-    assert!(fill != 0, "entry did not fill");
+    state::set_order_type(1); // IOC
+    for round in 1..=3 {
+        let price = asset_price(TEST_PERP).expect("perp price");
+        let amount = (minimum_qty(price) * AMOUNT_SCALE).round() as i32;
+        let (id, _, fill) = place_order(TEST_PERP, amount, 0.0, false, 0.0).expect("open should fill");
+        assert!(fill != 0, "entry did not fill");
 
-    let entry_fee = state::get_trade(id).expect("trade").entry_fee;
-    println!("entry fee: {entry_fee}");
-    assert!(entry_fee > 0.0, "entry fee was never read back from the fills feed");
+        // A BrokerTrade poll, as Zorro makes while the trade is open; it
+        // also fetches an entry fee the feed had not indexed at the fill.
+        let (_, _, cost, _, _) = trade_status(id).expect("status while open");
+        let entry_fee = state::get_trade(id).expect("trade").entry_fee;
+        println!("round {round}: entry fee {entry_fee}, cost while open {cost}");
+        assert!(entry_fee > 0.0, "entry fee was never read back from the fills feed");
+        assert!(cost < 0.0, "cost should be negative (money paid), got {cost}");
 
-    let (_, _, cost, _, _) = trade_status(id).expect("status while open");
-    println!("cost while open: {cost}");
-    assert!(cost < 0.0, "cost should be negative (money paid), got {cost}");
-
-    // Through close_trade, the path BrokerSell2 takes: the close is its own
-    // order, and its fee has to be booked against the trade it closed.
-    let outcome = close_trade(id, fill, 0.0).expect("close should fill");
-    println!("close fee: {}, cost: {}", outcome.fee, outcome.cost);
-    assert!(outcome.fee > 0.0, "the close reported no fee of its own");
-    assert!(outcome.cost < 0.0, "close cost should be negative, got {}", outcome.cost);
-
-    let total = state::get_trade(id).expect("trade").total_fees();
-    println!("total fees: {total}");
-    assert!(
-        total > entry_fee,
-        "closing added no fee: entry {entry_fee}, total {total}"
-    );
+        // Through close_trade, the path BrokerSell2 takes: the close is its
+        // own order, and its fee has to be booked against the trade it closed.
+        let outcome = close_trade(id, fill, 0.0).expect("close should fill");
+        let trade = state::get_trade(id).expect("trade");
+        println!("round {round}: close fee {}, cost {}", outcome.fee, outcome.cost);
+        assert!(trade.pending_close_oids.is_empty(), "a close fee is still pending after the wait");
+        assert!(outcome.fee > 0.0, "the close reported no fee of its own");
+        assert!(trade.close_fees > 0.0 && trade.total_fees() > entry_fee);
+        assert!(
+            (outcome.cost + trade.total_fees()).abs() < entry_fee,
+            "Zorro's cost {} must carry both fees ({})",
+            outcome.cost,
+            trade.total_fees()
+        );
+    }
+    assert!(net_position(TEST_PERP).unwrap().abs() < 1e-9, "flat");
 }
 
 /// Diagnostic: prints every open perp position with its funding so far.

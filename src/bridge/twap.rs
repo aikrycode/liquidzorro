@@ -176,7 +176,8 @@ pub fn stop(zorro_id: i32, info: &state::TradeInfo) -> Result<(), String> {
 /// BrokerTrade for a TWAP trade: `(open, close, cost, profit, fill_state)`.
 pub fn status(zorro_id: i32, info: &state::TradeInfo) -> Option<(f64, f64, f64, f64, i32)> {
     let twap_id = info.twap_id?;
-    let mut info = info.clone();
+    // trade_status settled any late close fees before handing over
+    let mut info = state::get_trade(zorro_id).unwrap_or_else(|| info.clone());
     if info.twap_running {
         // An unreadable history keeps the last known state rather than
         // guessing; the next poll asks again.

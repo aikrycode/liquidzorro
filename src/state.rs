@@ -46,6 +46,9 @@ pub struct TradeInfo {
     /// Fees of the closes booked against this trade so far. Kept apart from
     /// `entry_fee` so retrying the entry lookup cannot overwrite them.
     pub close_fees: f64,
+    /// Close orders whose fee the fills feed had not indexed yet; added to
+    /// `close_fees` once it has.
+    pub pending_close_oids: Vec<u64>,
     /// Order id of this trade's stop on the exchange, while one rests there.
     /// Held so closing the trade can cancel it: a stop left behind would
     /// still be live against whatever position comes next.
@@ -61,6 +64,20 @@ pub struct TradeInfo {
 }
 
 impl TradeInfo {
+    /// Adds the fee of each pending close that `lookup` finds, once, and
+    /// keeps waiting for the rest.
+    pub fn settle_close_fees(&mut self, lookup: impl Fn(u64) -> Option<f64>) {
+        let mut found = 0.0;
+        self.pending_close_oids.retain(|&oid| match lookup(oid) {
+            Some(fee) => {
+                found += fee;
+                false
+            }
+            None => true,
+        });
+        self.close_fees += found;
+    }
+
     /// Books the entry fees read so far: `usd` in all, `in_coin` of it paid
     /// in the coin bought. The coin part comes off the size -- now if the
     /// order has filled, else when it does (`fill_resting`). `done` once the
@@ -250,6 +267,7 @@ pub fn register_trade(coin: &str, oid: u64, is_buy: bool, entry_price: f64, entr
                 // the order was built against the resolved asset, so it is cached
                 lot: cached_asset(coin).map_or(DEFAULT_LOT, |a| a.lot_size()),
                 close_fees: 0.0,
+                pending_close_oids: Vec::new(),
                 stop_oid: None,
                 pending: false,
                 twap_id: None,
@@ -331,6 +349,15 @@ pub fn set_twap_progress(zorro_id: i32, filled: f64, avg_price: f64, fees: f64, 
 }
 
 /// Books a close's fee against the trade it closed.
+pub fn add_pending_close_fee(zorro_id: i32, close_oid: u64) {
+    with_trade(zorro_id, |info| info.pending_close_oids.push(close_oid));
+}
+
+/// Adds the fees `lookup` can now find for this trade's pending closes.
+pub fn settle_close_fees(zorro_id: i32, lookup: impl Fn(u64) -> Option<f64>) {
+    with_trade(zorro_id, |info| info.settle_close_fees(lookup));
+}
+
 pub fn add_close_fee(zorro_id: i32, fee: f64) {
     with_trade(zorro_id, |info| info.close_fees += fee);
 }

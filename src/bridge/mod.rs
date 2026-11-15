@@ -280,7 +280,7 @@ filled, and Zorro only keeps polling a GTC order, so it would never see the slic
             // held. Zorro must track the 9.993, or the last 0.007 of every
             // trade is a close that can never fill.
             let spot_buy = is_buy && !is_perp;
-            let fees = if spot_buy { settled_fees(order.oid) } else { order_fees(order.oid) };
+            let fees = if spot_buy { settled_fees(order.oid, 4) } else { order_fees(order.oid) };
             let fill_sz = gross_sz - fees.map_or(0.0, |f| f.in_base);
             if spot_buy && fees.is_none() {
                 state::log_message(&format!(
@@ -758,14 +758,39 @@ pub fn close_trade(trade_id: i32, amount: i32, limit: f64) -> Result<CloseOutcom
     let direction = if info.is_buy { 1.0 } else { -1.0 };
     let mut profit = direction * (price - info.entry_price) * closed_qty;
 
-    let fee = state::get_trade(close_id).map_or(0.0, |t| t.entry_fee);
+    // The fills feed can index a fill a moment after the exchange reports
+    // it. Read once, a missing fee was booked as zero and never again:
+    // Zorro does not know the close order, so nothing polled it.
+    settle_pending_close_fees(trade_id);
+    let close = state::get_trade(close_id);
+    let (fee, unindexed) = match close {
+        Some(c) if c.entry_fee_final => (c.entry_fee, None),
+        Some(c) => match settled_fees(c.oid, CLOSE_FEE_ATTEMPTS) {
+            Some(fees) => (fees.usd, None),
+            None => (0.0, Some(c.oid)),
+        },
+        None => (0.0, None),
+    };
     state::add_close_fee(trade_id, fee);
+    if let Some(oid) = unindexed {
+        state::add_pending_close_fee(trade_id, oid);
+    }
     let cost = -(state::get_trade(trade_id).map_or(fee, |t| t.total_fees())
         + trade_funding(&symbol, closed_qty));
 
     // Measured against what is left of the trade, not against the amount
     // asked for: a chunk can fill in full while the trade still holds more.
     let mut remaining = state::reduce_trade(trade_id, closed_qty);
+    if let Some(oid) = unindexed {
+        state::log_message(&format!(
+            "trade {trade_id}: the fee of close order {oid} is not indexed yet; {}",
+            if remaining > 0.0 {
+                "it is added on a later poll"
+            } else {
+                "the trade is closed and was booked without it"
+            }
+        ));
+    }
     // A whole-trade spot close can sell everything sellable and still leave
     // a sliver the exchange will not take. Retire it with the trade, or
     // Zorro retries a close that cannot fill for as long as it runs.
@@ -917,6 +942,19 @@ pub struct OrderFees {
     pub in_base: f64,
 }
 
+/// How often a close asks for its fee: 9 tries, 250 ms apart, about 2 s.
+/// Zorro waits only when the fills feed lags.
+const CLOSE_FEE_ATTEMPTS: u32 = 9;
+
+/// Adds the fees of this trade's earlier closes that the fills feed has
+/// indexed since.
+fn settle_pending_close_fees(zorro_id: i32) {
+    let pending = state::get_trade(zorro_id).is_some_and(|t| !t.pending_close_oids.is_empty());
+    if pending {
+        state::settle_close_fees(zorro_id, |oid| order_fees(oid).map(|f| f.usd));
+    }
+}
+
 /// Fees the exchange charged for order `oid`, summed over its fills.
 /// `None` when the order has no fills in the feed yet -- a fill can be
 /// acknowledged before it is indexed, so the caller retries rather than
@@ -939,11 +977,11 @@ pub fn order_fees(oid: u64) -> Option<OrderFees> {
     if seen { Some(total) } else { None }
 }
 
-/// `order_fees`, waiting briefly for the fills feed to catch up. Only for a
-/// spot buy, whose size depends on the fee and so cannot be fixed up later
-/// the way a fee alone can.
-fn settled_fees(oid: u64) -> Option<OrderFees> {
-    for attempt in 0..4 {
+/// `order_fees`, asking up to `attempts` times 250 ms apart while the fills
+/// feed catches up. For a spot buy, whose size depends on the fee, and for
+/// a close, whose fee Zorro books when the trade closes.
+fn settled_fees(oid: u64, attempts: u32) -> Option<OrderFees> {
+    for attempt in 0..attempts {
         if attempt > 0 {
             std::thread::sleep(std::time::Duration::from_millis(250));
         }
@@ -1066,6 +1104,7 @@ mod funding_tests {
 /// fill_state)`; `fill_state` follows BrokerTrade's contract.
 pub fn trade_status(zorro_id: i32) -> Option<(f64, f64, f64, f64, i32)> {
     let plugin = state::get()?;
+    settle_pending_close_fees(zorro_id);
     let info = state::get_trade(zorro_id)?;
 
     if info.twap_id.is_some() {
@@ -1170,11 +1209,29 @@ mod unknown_order_tests {
             entry_fee_in_coin: 0.0,
             lot: state::DEFAULT_LOT,
             close_fees: 0.0,
+            pending_close_oids: Vec::new(),
             stop_oid: None,
             pending,
             twap_id: None,
             twap_running: false,
         }
+    }
+
+    /// A close fee the feed had not indexed is added once it is, exactly
+    /// once, while the others keep waiting.
+    #[test]
+    fn a_late_close_fee_is_added_once_it_turns_up() {
+        let mut t = trade(true);
+        t.close_fees = 0.01;
+        t.pending_close_oids = vec![7, 8];
+        t.settle_close_fees(|oid| (oid == 7).then_some(0.02));
+        assert!((t.close_fees - 0.03).abs() < 1e-12);
+        assert_eq!(t.pending_close_oids, vec![8]);
+        t.settle_close_fees(|oid| (oid == 7).then_some(0.02));
+        assert!((t.close_fees - 0.03).abs() < 1e-12, "7 must not be added twice");
+        t.settle_close_fees(|_| Some(0.04));
+        assert!((t.close_fees - 0.07).abs() < 1e-12);
+        assert!(t.pending_close_oids.is_empty());
     }
 
     /// Only an order with something filled has fees to look up.
