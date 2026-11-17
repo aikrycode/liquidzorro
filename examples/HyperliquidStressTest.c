@@ -196,6 +196,7 @@ function run()
 	///////////////////////////////////////////////////////////////////////
 	if(Phase == PH_PREFLIGHT) {
 		int i, BadBars;
+		var MaxGap;
 		var AltPrice, Price;
 
 		printf("\n=== Hyperliquid stress test ===");
@@ -228,6 +229,15 @@ function run()
 		}
 		check("BrokerHistory2 returns coherent candles", BadBars == 0);
 		if(BadBars > 0) printf("\n        (%d malformed bars of %d)", BadBars, HISTORY_BARS);
+		// Bars missing from the history leave Zorro trading on old prices
+		// without an error. Hyperliquid has no candle for a minute without
+		// trades, and Zorro's bars follow every asset loaded: one that has
+		// not traded for hours ends the lookback there, and the bars jump.
+		MaxGap = 0;
+		for(i = 0; i < HISTORY_BARS-1; i++)
+			MaxGap = max(MaxGap, (wdate(i) - wdate(i+1))*1440);
+		printf("\nWidest step between bars: %.0f min", MaxGap);
+		check("The price history has no gap of 30 minutes or more", MaxGap < 30);
 
 		// --- starting position ---
 		printf("\nPosition before start: %.0f lots", heldLots());

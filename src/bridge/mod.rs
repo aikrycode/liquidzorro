@@ -1718,7 +1718,60 @@ pub fn history(
         "history({symbol} {interval}): asked {n_ticks} bars in {start_ole:.5}..{end_ole:.5}, used {start_ms}..{end_ms}, got {received}, returning {}",
         candles.len()
     ));
+    // Bars that stop short of the window, or skip part of it, give Zorro
+    // old prices with no error anywhere. Hyperliquid has no candle for a
+    // minute without trades, so a pair that has not traded for hours
+    // returns bars that end hours ago, and nothing else says so.
+    let opens: Vec<i64> = candles.iter().map(|c| c.time_open as i64).collect();
+    for problem in history_problems(&opens, end_ms, bar_ms) {
+        state::log_message(&format!("history({symbol} {interval}): {problem}"));
+    }
     Some(candles.into_iter().map(candle_to_t6).collect())
+}
+
+/// What is wrong with bars opening at `opens_newest_first` for a window
+/// ending at `end_ms`: no bars, the newest ending well before the window
+/// does, and holes between bars. Lag and holes count from 30 minutes or 10
+/// bars, whichever is longer, so a market skipping a quiet minute passes.
+fn history_problems(opens_newest_first: &[i64], end_ms: i64, bar_ms: i64) -> Vec<String> {
+    let limit = (10 * bar_ms).max(30 * 60_000);
+    let minutes = |ms: i64| ms / 60_000;
+    let mut problems = Vec::new();
+    let Some(&newest) = opens_newest_first.first() else {
+        problems.push(format!(
+            "no bars in the window ending {}; the market may not have traded in it",
+            utc_hhmm(end_ms)
+        ));
+        return problems;
+    };
+    let behind = end_ms - (newest + bar_ms);
+    if behind >= limit {
+        problems.push(format!(
+            "out of date: the newest bar ends {} min before the time asked for, {}; \
+             Hyperliquid's candles may be behind, or the market has not traded since",
+            minutes(behind),
+            utc_hhmm(end_ms)
+        ));
+    }
+    let widest = opens_newest_first
+        .windows(2)
+        .map(|w| (w[0] - w[1] - bar_ms, w[1] + bar_ms, w[0]))
+        .max_by_key(|&(missing, _, _)| missing);
+    if let Some((missing, from, to)) = widest.filter(|&(missing, _, _)| missing >= limit) {
+        problems.push(format!(
+            "{} min of bars missing, from {} to {}",
+            minutes(missing),
+            utc_hhmm(from),
+            utc_hhmm(to)
+        ));
+    }
+    problems
+}
+
+/// `HH:MM UTC` of a Unix millisecond time.
+fn utc_hhmm(unix_ms: i64) -> String {
+    let minute_of_day = unix_ms.div_euclid(60_000).rem_euclid(1440);
+    format!("{:02}:{:02} UTC", minute_of_day / 60, minute_of_day % 60)
 }
 
 /// The millisecond window to request, in `(start, end)`.
@@ -1796,6 +1849,63 @@ fn ole_to_unix_millis(ole: f64) -> i64 {
 
 fn unix_millis_to_ole(unix_millis: i64) -> f64 {
     unix_millis as f64 / 86_400_000.0 + 25569.0
+}
+
+#[cfg(test)]
+mod history_problem_tests {
+    use super::history_problems;
+
+    const MIN: i64 = 60_000;
+    // 03:18 UTC
+    const END: i64 = 1_794_700_800_000 + (3 * 60 + 18) * MIN;
+
+    /// Opens of `count` one-minute bars, newest first, the newest ending at `last_end`.
+    fn bars(last_end: i64, count: i64) -> Vec<i64> {
+        (1..=count).map(|i| last_end - i * MIN).collect()
+    }
+
+    #[test]
+    fn current_unbroken_bars_are_fine() {
+        assert!(history_problems(&bars(END, 50), END, MIN).is_empty());
+        // the newest bar still open, a few minutes of lag, a quiet minute
+        let mut opens = bars(END - 5 * MIN, 50);
+        opens.remove(10);
+        assert!(history_problems(&opens, END, MIN).is_empty());
+    }
+
+    #[test]
+    fn no_bars_at_all_is_reported() {
+        let problems = history_problems(&[], END, MIN);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].starts_with("no bars"), "{}", problems[0]);
+    }
+
+    /// The testnet failure: a pair with no trades for two hours.
+    #[test]
+    fn bars_that_stop_short_are_out_of_date() {
+        let problems = history_problems(&bars(END - 121 * MIN, 50), END, MIN);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("121 min before"), "{}", problems[0]);
+        assert!(problems[0].contains("03:18 UTC"), "{}", problems[0]);
+    }
+
+    #[test]
+    fn a_hole_between_bars_is_reported_with_where_it_is() {
+        let mut opens = bars(END, 20);
+        opens.extend(bars(END - 20 * MIN - 121 * MIN, 30));
+        let problems = history_problems(&opens, END, MIN);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert_eq!(problems[0], "121 min of bars missing, from 00:57 UTC to 02:58 UTC");
+    }
+
+    /// The limit grows with the bar, so hourly bars are not held to 30 minutes.
+    #[test]
+    fn the_limit_is_at_least_ten_bars() {
+        let hour = 60 * MIN;
+        let opens: Vec<i64> = (1..=20).map(|i| END - 2 * hour - i * hour).collect();
+        assert!(history_problems(&opens, END, hour).is_empty());
+        assert_eq!(history_problems(&opens, END + 9 * hour, hour).len(), 1);
+    }
 }
 
 #[cfg(test)]

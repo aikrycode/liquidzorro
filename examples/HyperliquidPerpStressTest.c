@@ -19,8 +19,9 @@
 
 #define PERP_SYMBOL     "ETH-PERP"   // Hyperliquid symbol "ETH"
 // Priced only, to prove mixed universes. Not HYPE/USDC: its testnet book
-// has quoted 756 / 2267, a spread no live-book check should accept.
-#define SPOT_SYMBOL     "FTEST/USDC"
+// has quoted 756 / 2267, a spread no live-book check should accept. Not
+// FTEST/USDC: it can go days without a trade, and so without a bar.
+#define SPOT_SYMBOL     "PURR/USDC"
 // Traded only in whole coins, priced under a cent: LotAmount 1, so $15 of
 // it is a few thousand lots instead of hundreds of millions.
 #define WHOLE_SYMBOL    "kPEPE-PERP" // Hyperliquid symbol "kPEPE"
@@ -210,7 +211,7 @@ function run()
 	///////////////////////////////////////////////////////////////////////
 	if(Phase == PH_PREFLIGHT) {
 		int i, BadBars;
-		var Price, SpotPrice, Starting;
+		var Price, SpotPrice, Starting, MaxGap;
 
 		printf("\n=== Hyperliquid perpetual stress test ===");
 
@@ -248,6 +249,15 @@ function run()
 			if(priceClose(i) <= 0) BadBars++;
 		}
 		check("BrokerHistory2 returns coherent perpetual candles", BadBars == 0);
+		// Bars missing from the history leave Zorro trading on old prices
+		// without an error. Hyperliquid has no candle for a minute without
+		// trades, and Zorro's bars follow every asset loaded: one that has
+		// not traded for hours ends the lookback there, and the bars jump.
+		MaxGap = 0;
+		for(i = 0; i < HISTORY_BARS-1; i++)
+			MaxGap = max(MaxGap, (wdate(i) - wdate(i+1))*1440);
+		printf("\nWidest step between bars: %.0f min", MaxGap);
+		check("The price history has no gap of 30 minutes or more", MaxGap < 30);
 
 		Starting = heldLots();
 		printf("\nPosition before start: %.0f lots (dust threshold %.0f)", Starting, dustLots());

@@ -176,6 +176,35 @@ fn connects_and_reads_market_data() {
     assert!(candles.is_some(), "expected candle history for {pair}");
 }
 
+/// The out-of-date warning must stay quiet on a pair that trades all the
+/// time, or it would be noise on every run. The thin spot pair can go
+/// hours without a trade, so for it the warning is only shown.
+#[test]
+#[ignore]
+fn current_history_has_no_gaps_or_lag() {
+    login(None, BaseUrl::Testnet).expect("login should succeed");
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    const BAR_MS: i64 = 60_000;
+    for symbol in [TEST_PERP, TEST_SPOT] {
+        let bars = history(symbol, 0.0, unix_millis_to_ole(now_ms), 1, 100)
+            .expect("history should succeed");
+        // T6 carries the bar's close, a millisecond before the next opens
+        let opens: Vec<i64> = bars
+            .iter()
+            .map(|b| ole_to_unix_millis(b.time) + 1 - BAR_MS)
+            .collect();
+        let problems = history_problems(&opens, now_ms, BAR_MS);
+        println!("{symbol}: {} bars, problems {problems:?}", bars.len());
+        if symbol == TEST_PERP {
+            assert_eq!(bars.len(), 100, "{symbol}: a full lookback");
+            assert!(problems.is_empty(), "{symbol}: {problems:?}");
+        }
+    }
+}
+
 /// Buys just above Hyperliquid's $10 minimum, checks trade status, sells
 /// back, flattens any leftover. Spends a little testnet USDC (slippage only).
 #[test]
