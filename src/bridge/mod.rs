@@ -1709,7 +1709,8 @@ pub fn history(
     n_ticks: i32,
 ) -> Option<Vec<T6>> {
     let plugin = state::get()?;
-    let interval = interval_for_minutes(n_tick_minutes);
+    let (interval_minutes, interval) = interval_for_minutes(n_tick_minutes);
+    let step_ms = interval_minutes as i64 * 60_000;
     let bar_ms = n_tick_minutes.max(1) as i64 * 60_000;
     let span_ms = n_ticks.max(1) as i64 * bar_ms;
 
@@ -1730,23 +1731,135 @@ pub fn history(
     };
 
     let received = candles.len();
-    candles.sort_by_key(|c| std::cmp::Reverse(c.time_open)); // oldest-first -> newest-first
-    candles.truncate(n_ticks.max(0) as usize);
+    candles.sort_by_key(|c| c.time_open);
+    let traded: Vec<Bar> = candles.iter().map(Bar::from_candle).collect();
+    // The window may open with quiet bars, or have no trades at all; they
+    // are filled from the last close before it, if there is one.
+    let first_open = (start_ms + step_ms - 1).div_euclid(step_ms) * step_ms;
+    let mut seeded = traded.clone();
+    if traded.first().map_or(true, |b| b.open_ms > first_open) {
+        if let Some(close) = last_close_before(plugin, symbol, interval, step_ms, start_ms) {
+            seeded.insert(0, Bar::quiet(first_open, close));
+        }
+    }
+    let mut bars = fill_quiet_bars(&seeded, step_ms, end_ms);
+    let filled = bars.len() - traded.len();
+    bars.reverse(); // oldest-first -> newest-first
+    bars.truncate(n_ticks.max(0) as usize);
     // Logged because a short history is silent on Zorro's side until the
     // lookback fails, and the window is the only thing that explains it.
     state::log_message(&format!(
-        "history({symbol} {interval}): asked {n_ticks} bars in {start_ole:.5}..{end_ole:.5}, used {start_ms}..{end_ms}, got {received}, returning {}",
-        candles.len()
+        "history({symbol} {interval}): asked {n_ticks} bars in {start_ole:.5}..{end_ole:.5}, used {start_ms}..{end_ms}, got {received}, filled {filled} quiet, returning {}",
+        bars.len()
     ));
-    // Bars that stop short of the window, or skip part of it, give Zorro
-    // old prices with no error anywhere. Hyperliquid has no candle for a
-    // minute without trades, so a pair that has not traded for hours
-    // returns bars that end hours ago, and nothing else says so.
-    let opens: Vec<i64> = candles.iter().map(|c| c.time_open as i64).collect();
+    // Long quiet stretches are still worth knowing about, even filled: the
+    // filled bars carry no price movement, and if the candles were merely
+    // behind rather than quiet, the price they hold is old.
+    let opens: Vec<i64> = traded.iter().rev().map(|b| b.open_ms).collect();
+    let note = if filled > 0 { "; filled with flat bars at the last close" } else { "" };
     for problem in history_problems(&opens, end_ms, bar_ms) {
-        state::log_message(&format!("history({symbol} {interval}): {problem}"));
+        state::log_message(&format!("history({symbol} {interval}): {problem}{note}"));
     }
-    Some(candles.into_iter().map(candle_to_t6).collect())
+    Some(bars.into_iter().map(|b| b.to_t6(step_ms)).collect())
+}
+
+/// Close of the last bar of `interval` that ended before `before_ms`,
+/// looked for over the 5000 bars before it (Hyperliquid's most per
+/// request; three and a half days of 1-minute bars). Bars of the same
+/// interval end before the window starts, so nothing after it leaks in.
+fn last_close_before(
+    plugin: &state::PluginState,
+    symbol: &str,
+    interval: &str,
+    step_ms: i64,
+    before_ms: i64,
+) -> Option<f32> {
+    let from = before_ms - 5000 * step_ms;
+    let candles = runtime::get()
+        .block_on(plugin.info_client.candles_snapshot(
+            symbol.to_string(),
+            interval.to_string(),
+            from.max(0) as u64,
+            before_ms as u64,
+        ))
+        .ok()?;
+    candles
+        .iter()
+        .filter(|c| (c.time_open as i64) + step_ms <= before_ms)
+        .max_by_key(|c| c.time_open)
+        .and_then(|c| c.close.parse().ok())
+}
+
+/// One candle, as far as Zorro needs it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Bar {
+    open_ms: i64,
+    open: f32,
+    high: f32,
+    low: f32,
+    close: f32,
+    volume: f32,
+}
+
+impl Bar {
+    fn from_candle(c: &CandlesSnapshotResponse) -> Self {
+        let parse = |s: &str| s.parse::<f32>().unwrap_or(0.0);
+        Bar {
+            open_ms: c.time_open as i64,
+            open: parse(&c.open),
+            high: parse(&c.high),
+            low: parse(&c.low),
+            close: parse(&c.close),
+            volume: parse(&c.vlm),
+        }
+    }
+
+    /// A bar in which nothing traded: flat at the last close, no volume.
+    fn quiet(open_ms: i64, close: f32) -> Self {
+        Bar { open_ms, open: close, high: close, low: close, close, volume: 0.0 }
+    }
+
+    /// Stamped with its close, as Zorro expects; Hyperliquid's close time is
+    /// the last millisecond of the bar.
+    fn to_t6(self, step_ms: i64) -> T6 {
+        T6 {
+            time: unix_millis_to_ole(self.open_ms + step_ms - 1),
+            f_high: self.high,
+            f_low: self.low,
+            f_open: self.open,
+            f_close: self.close,
+            f_val: 0.0,
+            f_vol: self.volume,
+        }
+    }
+}
+
+/// `traded` (oldest first, one bar per interval that had trades) with a
+/// flat bar at the last close for every interval without any, between
+/// them and after the newest up to the last one closed by `end_ms`.
+///
+/// Hyperliquid has no candle for an interval without trades. Zorro builds
+/// one bar timeline across every asset loaded, so a quiet pair's missing
+/// bars ended the lookback where it stopped trading and made the bars jump
+/// to the present. A real market that does not trade has not moved, so
+/// the last close is its price. Nothing is filled before the first bar:
+/// there is no price to fill with.
+fn fill_quiet_bars(traded: &[Bar], step_ms: i64, end_ms: i64) -> Vec<Bar> {
+    let mut out = Vec::with_capacity(traded.len());
+    for (i, bar) in traded.iter().enumerate() {
+        out.push(*bar);
+        let next_open = match traded.get(i + 1) {
+            Some(next) => next.open_ms,
+            // after the newest: only bars that have closed by the end
+            None => (end_ms - step_ms + 1).div_euclid(step_ms) * step_ms + step_ms,
+        };
+        let mut t = bar.open_ms + step_ms;
+        while t < next_open {
+            out.push(Bar::quiet(t, bar.close));
+            t += step_ms;
+        }
+    }
+    out
 }
 
 /// What is wrong with bars opening at `opens_newest_first` for a window
@@ -1826,21 +1939,9 @@ fn now_unix_millis() -> i64 {
 }
 
 
-fn candle_to_t6(c: CandlesSnapshotResponse) -> T6 {
-    let parse = |s: &str| s.parse::<f32>().unwrap_or(0.0);
-    T6 {
-        time: unix_millis_to_ole(c.time_close as i64),
-        f_high: parse(&c.high),
-        f_low: parse(&c.low),
-        f_open: parse(&c.open),
-        f_close: parse(&c.close),
-        f_val: 0.0,
-        f_vol: parse(&c.vlm),
-    }
-}
-
-/// Closest Hyperliquid candle interval not finer than the requested bar length.
-fn interval_for_minutes(minutes: i32) -> &'static str {
+/// Closest Hyperliquid candle interval not longer than the requested bar
+/// length, as `(minutes, name)`.
+fn interval_for_minutes(minutes: i32) -> (i32, &'static str) {
     const STEPS: &[(i32, &str)] = &[
         (1, "1m"),
         (3, "3m"),
@@ -1858,8 +1959,8 @@ fn interval_for_minutes(minutes: i32) -> &'static str {
         .iter()
         .rev()
         .find(|(step, _)| minutes >= *step)
-        .map(|(_, name)| *name)
-        .unwrap_or("1m")
+        .copied()
+        .unwrap_or((1, "1m"))
 }
 
 /// OLE date -> Unix ms (OLE day 0 = 1899-12-30; epoch is 25569 days later).
@@ -1869,6 +1970,76 @@ fn ole_to_unix_millis(ole: f64) -> i64 {
 
 fn unix_millis_to_ole(unix_millis: i64) -> f64 {
     unix_millis as f64 / 86_400_000.0 + 25569.0
+}
+
+#[cfg(test)]
+mod fill_quiet_bars_tests {
+    use super::{fill_quiet_bars, Bar};
+
+    const MIN: i64 = 60_000;
+    const T0: i64 = 1_794_700_800_000; // 00:00 UTC
+
+    fn traded(minute: i64, close: f32) -> Bar {
+        Bar { open_ms: T0 + minute * MIN, open: close - 0.5, high: close + 1.0, low: close - 1.0, close, volume: 3.0 }
+    }
+
+    fn opens(bars: &[Bar]) -> Vec<i64> {
+        bars.iter().map(|b| (b.open_ms - T0) / MIN).collect()
+    }
+
+    /// The live failure: PURR did not trade for 44 minutes, and Zorro's
+    /// lookback broke there. Every minute must have a bar.
+    #[test]
+    fn a_hole_between_trades_is_filled_at_the_last_close() {
+        let bars = fill_quiet_bars(&[traded(0, 4.5), traded(4, 4.6)], MIN, T0 + 5 * MIN);
+        assert_eq!(opens(&bars), vec![0, 1, 2, 3, 4]);
+        for quiet in &bars[1..4] {
+            assert_eq!(*quiet, Bar::quiet(quiet.open_ms, 4.5));
+            assert_eq!(quiet.volume, 0.0);
+        }
+        assert_eq!(bars[4], traded(4, 4.6), "real bars are untouched");
+    }
+
+    /// No trades since minute 2, asked up to 06:30 into minute 6: bars for
+    /// minutes 3, 4 and 5, which have closed; not for 6, still open.
+    #[test]
+    fn quiet_minutes_after_the_last_trade_are_filled_up_to_the_end() {
+        let end = T0 + 6 * MIN + 30_000;
+        let bars = fill_quiet_bars(&[traded(0, 4.5), traded(2, 4.7)], MIN, end);
+        assert_eq!(opens(&bars), vec![0, 1, 2, 3, 4, 5]);
+        assert_eq!(bars[5], Bar::quiet(T0 + 5 * MIN, 4.7));
+    }
+
+    /// An end exactly on a bar boundary: the bar ending there has closed.
+    #[test]
+    fn a_bar_ending_exactly_at_the_end_counts_as_closed() {
+        let bars = fill_quiet_bars(&[traded(0, 4.5)], MIN, T0 + 3 * MIN);
+        assert_eq!(opens(&bars), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn an_unbroken_or_empty_history_is_left_alone() {
+        let unbroken = [traded(0, 1.0), traded(1, 2.0), traded(2, 3.0)];
+        assert_eq!(fill_quiet_bars(&unbroken, MIN, T0 + 3 * MIN), unbroken.to_vec());
+        // the newest still open: nothing after it
+        assert_eq!(fill_quiet_bars(&unbroken, MIN, T0 + 2 * MIN + 1), unbroken.to_vec());
+        assert!(fill_quiet_bars(&[], MIN, T0).is_empty());
+    }
+
+    #[test]
+    fn longer_bars_fill_in_their_own_steps() {
+        let hour = 60 * MIN;
+        let bars = fill_quiet_bars(&[traded(0, 4.5), traded(180, 4.6)], hour, T0 + 4 * hour);
+        assert_eq!(opens(&bars), vec![0, 60, 120, 180]);
+    }
+
+    /// Zorro reads a bar by its close: the last millisecond of the bar, as
+    /// Hyperliquid's own close times.
+    #[test]
+    fn a_bar_is_stamped_with_its_close() {
+        let t6 = Bar::quiet(T0, 4.5).to_t6(MIN);
+        assert_eq!(super::ole_to_unix_millis(t6.time), T0 + MIN - 1);
+    }
 }
 
 #[cfg(test)]

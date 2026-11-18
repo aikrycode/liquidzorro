@@ -255,13 +255,14 @@ function run()
 		check("BrokerHistory2 returns coherent perpetual candles", BadBars == 0);
 		// Bars missing from the history leave Zorro trading on old prices
 		// without an error. Hyperliquid has no candle for a minute without
-		// trades, and Zorro's bars follow every asset loaded: one that has
-		// not traded for hours ends the lookback there, and the bars jump.
+		// trades, and Zorro's bars follow every asset loaded: one that had
+		// not traded for 44 minutes broke the lookback there. The plugin
+		// fills such minutes with flat bars, so every step is one bar.
 		MaxGap = 0;
 		for(i = 0; i < HISTORY_BARS-1; i++)
 			MaxGap = max(MaxGap, (wdate(i) - wdate(i+1))*1440);
 		printf("\nWidest step between bars: %.0f min", MaxGap);
-		check("The price history has no gap of 30 minutes or more", MaxGap < 30);
+		check("The price history has a bar for every minute", MaxGap < 1.5);
 
 		Starting = heldLots();
 		printf("\nPosition before start: %.0f lots (dust threshold %.0f)", Starting, dustLots());
