@@ -13,7 +13,7 @@ use hyperliquid_rust_sdk::{
     ExchangeResponseStatus, InfoClient,
 };
 
-use crate::assets::{self, AssetInfo};
+use crate::assets::{self, AssetInfo, Rounding};
 use crate::ffi::{T6, NAY};
 use crate::{runtime, state};
 
@@ -69,6 +69,13 @@ pub fn lot_size(symbol: &str) -> Result<f64, String> {
     let plugin = state::get().ok_or("not logged in")?;
     let asset = runtime::get().block_on(resolve_asset(&plugin.info_client, symbol))?;
     Ok(asset.lot_size())
+}
+
+/// The finest price step of `symbol`, reported to Zorro as its PIP.
+pub fn pip(symbol: &str) -> Result<f64, String> {
+    let plugin = state::get().ok_or("not logged in")?;
+    let asset = runtime::get().block_on(resolve_asset(&plugin.info_client, symbol))?;
+    Ok(asset.pip())
 }
 
 /// A size in coins as a Zorro lot count.
@@ -238,7 +245,9 @@ filled, and Zorro only keeps polling a GTC order, so it would never see the slic
         let tif = time_in_force(order_type, limit > 0.0)?;
         let limit_px = if limit > 0.0 {
             // An unrounded price straight from Zorro is rejected as invalid.
-            assets::round_price(limit, &asset)
+            // Rounded away from the book, so a post-only order rounding into
+            // the other side is not refused for it.
+            assets::round_price(limit, &asset, Rounding::passive(is_buy))
         } else {
             marketable_price(&plugin.info_client, symbol, &asset, is_buy, 0.05).await?
         };
@@ -389,7 +398,7 @@ pub fn modify_order(zorro_id: i32, new_limit: f64, new_amount: i32) -> Result<i3
         if sz <= 0.0 {
             return Err(format!("{new_amount} lots rounds to zero size"));
         }
-        let limit_px = assets::round_price(new_limit, &asset);
+        let limit_px = assets::round_price(new_limit, &asset, Rounding::passive(info.is_buy));
         // Keeps what the order was: a post-only order stays post-only, and
         // a reduce-only close stays reduce-only.
         let tif = order.order.tif.clone().unwrap_or_else(|| "Gtc".to_string());
@@ -539,7 +548,7 @@ async fn marketable_price(
         }
     };
     let slipped = reference * if is_buy { 1.0 + slippage } else { 1.0 - slippage };
-    Ok(assets::round_price(slipped, asset))
+    Ok(assets::round_price(slipped, asset, Rounding::aggressive(is_buy)))
 }
 
 /// Best price currently offered to the side we are about to take: the lowest
@@ -630,7 +639,7 @@ fn place_stop(
                 "stop distance {stop_dist} puts the trigger at or below zero"
             ));
         }
-        let trigger_px = assets::round_price(raw_trigger, &asset);
+        let trigger_px = assets::round_price(raw_trigger, &asset, Rounding::Nearest);
 
         // Triggering is what decides the fill, so the limit only has to be
         // loose enough not to block it. Past the trigger by the same
@@ -643,6 +652,8 @@ fn place_stop(
             }
             .max(0.0),
             &asset,
+            // the stop's own order trades at once, so toward the book
+            Rounding::aggressive(!entry_is_buy),
         );
 
         let order = ClientOrderRequest {
@@ -845,7 +856,7 @@ fn spot_close_plan(
         // The minimum is checked against the price the order will carry,
         // which for a market sell sits under the bid by the slippage margin.
         let price = if limit > 0.0 {
-            assets::round_price(limit, &asset)
+            assets::round_price(limit, &asset, Rounding::passive(false))
         } else {
             marketable_price(&plugin.info_client, symbol, &asset, false, 0.05).await?
         };

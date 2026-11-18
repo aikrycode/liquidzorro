@@ -42,6 +42,16 @@ impl AssetInfo {
         max_decimals.saturating_sub(self.sz_decimals)
     }
 
+    /// The finest price step Hyperliquid accepts on this asset, reported to
+    /// Zorro as its PIP. Zorro rounds the limit prices it sends to the PIP,
+    /// so anything coarser moves orders: with a PIP of 1 a 2.7477 limit went
+    /// out at 3, and one under 50 cents would go out at 0. Five significant
+    /// figures can make the valid step coarser than this at a given price;
+    /// the plugin's own rounding takes care of that.
+    pub fn pip(&self) -> f64 {
+        10f64.powi(-(self.max_price_decimals() as i32))
+    }
+
     /// Coins in one Zorro lot. Zorro counts an order in lots with a 32-bit
     /// int, so the lot has to be small enough for fine sizes and large
     /// enough that a cheap coin's order still fits. An asset traded in
@@ -142,26 +152,55 @@ fn ceil_size(value: f64, sz_decimals: u32) -> f64 {
     ((value * factor) - 1e-9).ceil() / factor
 }
 
-/// Rounds a price to 5 significant figures and the asset's decimal cap,
-/// which is what Hyperliquid enforces.
-pub fn round_price(value: f64, asset: &AssetInfo) -> f64 {
-    round_to_significant_and_decimal(value, 5, asset.max_price_decimals())
+/// Which way a price is rounded to a valid one.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Rounding {
+    Nearest,
+    Down,
+    Up,
+}
+
+impl Rounding {
+    /// Away from the other side of the book: a buy down, a sell up. For a
+    /// limit price, so rounding never makes an order cross the book -- a
+    /// post-only buy rounded up into the ask is refused.
+    pub fn passive(is_buy: bool) -> Self {
+        if is_buy { Rounding::Down } else { Rounding::Up }
+    }
+
+    /// Toward the other side of the book: a buy up, a sell down. For a
+    /// price meant to trade at once, so rounding never makes it miss.
+    pub fn aggressive(is_buy: bool) -> Self {
+        if is_buy { Rounding::Up } else { Rounding::Down }
+    }
+}
+
+/// Rounds a price to one Hyperliquid accepts: at most 5 significant figures
+/// and the asset's decimal cap, except that a whole number is always valid.
+/// So a price with 5 or more digits before the point is rounded to a whole
+/// number, not cut to 5 figures (103457.3 becomes 103457, not 103460).
+pub fn round_price(value: f64, asset: &AssetInfo, rounding: Rounding) -> f64 {
+    if value == 0.0 || !value.is_finite() {
+        return value;
+    }
+    let magnitude = value.abs().log10().floor() as i32;
+    let decimals = (4 - magnitude).clamp(0, asset.max_price_decimals() as i32);
+    let factor = 10f64.powi(decimals);
+    let scaled = value * factor;
+    // Nudged like the size helpers, so a price already on a step is kept
+    // and not thrown a whole step away by float error.
+    let steps = match rounding {
+        Rounding::Nearest => scaled.round(),
+        Rounding::Down => (scaled + 1e-9).floor(),
+        Rounding::Up => (scaled - 1e-9).ceil(),
+    };
+    // Dividing gives the exact decimal value; multiplying by 10^-n would not.
+    steps / factor
 }
 
 pub fn round_to_decimals(value: f64, decimals: u32) -> f64 {
     let factor = 10f64.powi(decimals as i32);
     (value * factor).round() / factor
-}
-
-fn round_to_significant_and_decimal(value: f64, sig_figs: u32, max_decimals: u32) -> f64 {
-    if value == 0.0 || !value.is_finite() {
-        return value;
-    }
-    let abs_value = value.abs();
-    let magnitude = abs_value.log10().floor() as i32;
-    let scale = 10f64.powi(sig_figs as i32 - magnitude - 1);
-    let rounded = (abs_value * scale).round() / scale;
-    round_to_decimals(rounded.copysign(value), max_decimals)
 }
 
 #[cfg(test)]
@@ -216,14 +255,78 @@ mod tests {
         assert_eq!(perp(8).max_price_decimals(), 0);
     }
 
+    use Rounding::{Down, Nearest, Up};
+
     #[test]
     fn prices_round_to_five_significant_figures() {
         // a price carrying six significant figures is trimmed to five
-        assert_eq!(round_price(92.41500, &spot(2)), 92.415);
-        assert_eq!(round_price(92.42224, &spot(2)), 92.422);
+        assert_eq!(round_price(92.41500, &spot(2), Nearest), 92.415);
+        assert_eq!(round_price(92.42224, &spot(2), Nearest), 92.422);
         // same value on a perp is capped tighter
-        assert_eq!(round_price(92.42224, &perp(2)), 92.422);
-        assert_eq!(round_price(1234.567, &perp(2)), 1234.6);
+        assert_eq!(round_price(92.42224, &perp(2), Nearest), 92.422);
+        assert_eq!(round_price(1234.567, &perp(2), Nearest), 1234.6);
+    }
+
+    /// The live case: a 2.7477 PURR limit is already valid and must go out
+    /// unchanged, whichever way it would round.
+    #[test]
+    fn a_valid_price_is_kept_whichever_way_it_rounds() {
+        for r in [Nearest, Down, Up] {
+            assert_eq!(round_price(2.7477, &spot(0), r), 2.7477);
+            assert_eq!(round_price(0.0042, &perp(0), r), 0.0042);
+            assert_eq!(round_price(3000.1, &perp(4), r), 3000.1);
+        }
+    }
+
+    /// A limit buy at 4.57955 rounded to the nearest step went up to 4.5796
+    /// and could cross the ask; rounded passively it rests at 4.5795.
+    #[test]
+    fn limit_prices_round_away_from_the_book() {
+        assert_eq!(round_price(4.57955, &spot(0), Rounding::passive(true)), 4.5795);
+        assert_eq!(round_price(4.57955, &spot(0), Rounding::passive(false)), 4.5796);
+        assert_eq!(round_price(4.57951, &spot(0), Down), 4.5795);
+        assert_eq!(round_price(4.57951, &spot(0), Up), 4.5796);
+    }
+
+    #[test]
+    fn marketable_prices_round_toward_the_book() {
+        assert_eq!(round_price(4.57951, &spot(0), Rounding::aggressive(true)), 4.5796);
+        assert_eq!(round_price(4.57959, &spot(0), Rounding::aggressive(false)), 4.5795);
+    }
+
+    /// Hyperliquid accepts any whole number, so a BTC limit keeps its
+    /// dollars instead of being cut to every $10.
+    #[test]
+    fn prices_of_five_digits_and_more_round_to_whole_numbers() {
+        assert_eq!(round_price(103457.3, &perp(5), Nearest), 103457.0);
+        assert_eq!(round_price(103457.3, &perp(5), Up), 103458.0);
+        assert_eq!(round_price(103457.0, &perp(5), Down), 103457.0);
+        assert_eq!(round_price(12345.6, &perp(5), Down), 12345.0);
+        // four digits still keep one decimal (5 significant figures)
+        assert_eq!(round_price(1234.56, &perp(4), Down), 1234.5);
+    }
+
+    /// The decimal cap still applies under 5 significant figures: a perp
+    /// with 4 size decimals allows only 2 price decimals.
+    #[test]
+    fn the_decimal_cap_still_applies() {
+        assert_eq!(round_price(1.23456, &perp(4), Nearest), 1.23);
+        assert_eq!(round_price(1.23456, &perp(4), Up), 1.24);
+        assert_eq!(round_price(0.00123456, &perp(0), Down), 0.001234);
+    }
+
+    #[test]
+    fn the_pip_is_the_finest_step_the_exchange_accepts() {
+        assert_eq!(perp(4).pip(), 0.01); // ETH
+        assert_eq!(perp(5).pip(), 0.1); // BTC
+        assert_eq!(perp(0).pip(), 0.000001); // kPEPE
+        assert_eq!(spot(0).pip(), 0.00000001); // PURR
+        assert_eq!(spot(2).pip(), 0.000001);
+        // any price rounded the plugin's way is a whole number of pips
+        for (px, a) in [(2.7477, spot(0)), (0.004213, perp(0)), (3012.37, perp(4))] {
+            let steps = round_price(px, &a, Nearest) / a.pip();
+            assert!((steps - steps.round()).abs() < 1e-6, "{px}: {steps}");
+        }
     }
 
     /// Zorro derives both trade profit and Leverage from PipCost/Pip, and
@@ -232,16 +335,17 @@ mod tests {
     /// price/MarginCost = 100000 and sent that back via SET_LEVERAGE.
     #[test]
     fn pip_ratio_matches_lot_size() {
-        let pip = 1.0;
-        let pip_cost = 1.0 / crate::bridge::AMOUNT_SCALE;
-        let lot_size = 1.0 / crate::bridge::AMOUNT_SCALE;
-        assert_eq!(pip_cost / pip, lot_size);
+        for asset in [perp(4), perp(0), spot(0), spot(2)] {
+            let pip = asset.pip();
+            let pip_cost = pip * asset.lot_size(); // what BrokerAsset reports
+            assert!((pip_cost / pip - asset.lot_size()).abs() < 1e-15);
 
-        // leverage Zorro infers, for a 1x spot lot: price/MarginCost * PipCost/Pip
-        let price = 2374.0;
-        let margin_cost = price / crate::bridge::AMOUNT_SCALE; // what BrokerAsset reports
-        let leverage = price / margin_cost * (pip_cost / pip);
-        assert!((leverage - 1.0).abs() < 1e-9, "expected 1x, got {leverage}");
+            // leverage Zorro infers, for a 1x lot: price/MarginCost * PipCost/Pip
+            let price = 2374.0;
+            let margin_cost = price * asset.lot_size();
+            let leverage = price / margin_cost * (pip_cost / pip);
+            assert!((leverage - 1.0).abs() < 1e-9, "expected 1x, got {leverage}");
+        }
     }
 
     /// Whole-coin assets count lots in coins, so a cheap coin's order fits
@@ -260,8 +364,8 @@ mod tests {
 
     #[test]
     fn rounding_handles_zero_and_negatives() {
-        assert_eq!(round_price(0.0, &perp(2)), 0.0);
-        assert_eq!(round_price(-92.42224, &spot(2)), -92.422);
+        assert_eq!(round_price(0.0, &perp(2), Nearest), 0.0);
+        assert_eq!(round_price(-92.42224, &spot(2), Nearest), -92.422);
     }
 
     /// The second live failure: chunks that floored under $10 were

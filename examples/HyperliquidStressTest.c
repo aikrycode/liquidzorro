@@ -83,6 +83,8 @@ var PositionAtStart;     // coins the account held before the run
 var PositionBeforeBuy;
 var PositionBeforeReject;
 int LimitTradeID;
+var LimitAsked;       // limit price the script asked for
+var LimitResting;     // price the resting order carries, per Zorro
 int LimitPollsLeft;
 int LimitCancelled;
 int SweepsLeft;
@@ -345,6 +347,8 @@ function run()
 		if(Price <= 0) return;
 
 		LimitPrice = Price*0.6;                // deep below market: must not fill
+		LimitAsked = LimitPrice;
+		LimitResting = 0;
 		brokerCommand(CMD_SET_ORDERTYPE, ORDERTYPE_GTC);
 		OrderLimit = LimitPrice;
 		Lots = ceil(LIMIT_USD/LimitPrice*AMOUNT_SCALE);
@@ -370,6 +374,7 @@ function run()
 			if(TradeIsPending || TradeLots == 0) {
 				Pending++;
 				LimitTradeID = TradeID;
+				LimitResting = TradePriceOpen;
 			}
 		}
 		LimitPollsLeft--;
@@ -382,6 +387,12 @@ function run()
 			return;
 		}
 		printf("\nPending limit order registered, trade id %d", LimitTradeID);
+		// The plugin reports the price the order went out at. Zorro rounds
+		// limits to the asset's PIP first, and a PIP of 1 once sent a 2.7477
+		// limit out at 3. Five significant figures allow 0.01% of rounding.
+		printf("\nLimit asked %.6f, resting at %.6f", LimitAsked, LimitResting);
+		check("The limit order rests at the price asked for",
+			abs(LimitResting - LimitAsked) <= LimitAsked*0.0001);
 		Phase = PH_LIMIT_CANCEL;
 		return;
 	}

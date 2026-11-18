@@ -176,8 +176,8 @@ pub unsafe extern "C" fn BrokerAsset(
             state::log_message(&format!("BrokerAsset({symbol}): price unavailable"));
             return 0;
         };
-        let lot = match bridge::lot_size(symbol) {
-            Ok(lot) => lot,
+        let (lot, pip) = match bridge::lot_size(symbol).and_then(|lot| Ok((lot, bridge::pip(symbol)?))) {
+            Ok(v) => v,
             Err(e) => {
                 state::log_message(&format!("BrokerAsset({symbol}): {e}"));
                 return 0;
@@ -195,15 +195,18 @@ pub unsafe extern "C" fn BrokerAsset(
             *p_volume = 0.0;
         }
         if !p_pip.is_null() {
-            *p_pip = 1.0;
+            // The exchange's finest price step. Zorro rounds the limit
+            // prices it sends to the pip, so a pip of 1 sent a 2.7477 limit
+            // out at 3.
+            *p_pip = pip;
         }
         if !p_pip_cost.is_null() {
             // Value of one pip per lot. Zorro computes profit as
-            // priceDiff * Lots * PipCost / Pip, so with Pip 1 this is the
-            // lot size in coins. It also feeds Leverage = price /
+            // priceDiff * Lots * PipCost / Pip, so PipCost / Pip has to be
+            // the lot size in coins. It also feeds Leverage = price /
             // MarginCost * PipCost / Pip, which Zorro sends straight back
             // via SET_LEVERAGE.
-            *p_pip_cost = lot;
+            *p_pip_cost = pip * lot;
         }
         if !p_min_amount.is_null() {
             *p_min_amount = 0.0;
