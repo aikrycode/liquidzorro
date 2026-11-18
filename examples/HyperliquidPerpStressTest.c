@@ -98,6 +98,8 @@
 #define PH_WHOLE_CHECK  30
 #define PH_WHOLE_FLAT   31
 #define PH_LOT_MISMATCH 32
+#define PH_RELOGIN      33
+#define PH_RELOGIN_CHECK 34
 
 int Phase;
 int Passed, Failed;
@@ -324,6 +326,30 @@ function run()
 		// the balance jump by the whole margin.
 		printf("\nBalance while long: %.2f (started %.2f)", Balance, StartBalance);
 		check("An open position does not inflate the balance", abs(Balance - StartBalance) < 1);
+		Phase = PH_RELOGIN;
+		return;
+	}
+
+	// Log out and back in with the long still open -- what Zorro does by
+	// itself when the connection drops. Zorro keeps managing the trade by
+	// the same id afterwards, so the plugin must still know it: the
+	// exitLong that follows is the real test.
+	if(Phase == PH_RELOGIN) {
+		int Out, In;
+		printf("\n--- re-login with a trade open ---");
+		Out = login(2);
+		In = login(1);
+		printf("\nlogin(2) -> %d, login(1) -> %d", Out, In);
+		check("Zorro logs back in with a trade open", In == 1);
+		Phase = PH_RELOGIN_CHECK;
+		return;
+	}
+
+	if(Phase == PH_RELOGIN_CHECK) {
+		int Open = 0;
+		for(open_trades) if(TradeIsLong && TradeLots > 0) Open++;
+		asset(PERP_SYMBOL);   // the trade loop may leave another asset selected
+		check("Zorro still holds the long after the re-login", Open == 1);
 		Phase = PH_CLOSE_LONG;
 		return;
 	}

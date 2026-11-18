@@ -97,6 +97,8 @@ cargo test --lib -- --ignored --nocapture
 
 You can switch between Demo and Real, or paste a different key, and press `[Trade]` again without restarting Zorro -- the plugin reconnects on each login.
 
+When the connection drops, Zorro logs out and back in by itself and goes on managing its open trades. The plugin keeps them across that re-login, so they can still be polled and closed; a login to another account or network drops them instead, and the log says how many.
+
 ### Demo strategy walkthrough
 
 `examples/HyperliquidBuySellDemo.c` (32-bit Lite-C) / `HyperliquidBuySellDemo+.cpp` (64-bit, needs external compilation -- see its header) is a linear state machine, advancing one step per `run()` call (~once a minute, since `BarPeriod = 1`):
@@ -203,6 +205,7 @@ This address only ever changes in a signed commit -- before sending, check that 
 ## Known Issues
 
 - **Spot leftovers under one size step are lost:** a Hyperliquid spot buy pays its fee in the coin bought, so closing the trade always leaves a fraction of one size step that no order can sell. The plugin closes the trade anyway and books that fraction as a loss, because Hyperliquid sweeps such balances from the wallet -- on testnet within minutes, with nothing returned. On fine-stepped pairs this is a fraction of a cent; on PURR/USDC, which trades in whole coins, it is up to one coin (~$4.50) per trade. If the account already holds some of the coin, the close sells the whole step anyway and the shortfall comes out of those coins, so nothing is lost.
+- **A Zorro restart loses the plugin's trades:** the plugin keeps open trades across a logout and login in the same Zorro session, but not across a restart of Zorro, so the strategies set `SaveMode = 0` and start flat. Positions and resting orders stay on the exchange and have to be closed there or by a new order.
 - **64-bit Zorro needs Zorro S:** Zorro64 has no Lite-C compiler and runs only C++ strategies, and without a Zorro S licence it refuses to start them ("Error 063: C++ direct start requires Zorro S"), even precompiled. The plugin itself loads there and appears in the Broker dropdown. Without Zorro S, use the 32-bit `Zorro.exe` with Lite-C, which is verified end to end.
 - **TWAP entries (`SET_TWAP`) must be sent as GTC:** wrap the entry in `setf(TradeMode, TR_GTC)` ... `resf(TradeMode, TR_GTC)`. A TWAP starts with nothing filled, and Zorro only keeps polling a GTC order; sent any other way it would book 0 lots and never see the slices, so the plugin refuses it. TWAPs are perps only, at least $100, 5-1440 minutes, and carry no stop. A TWAP keeps slicing on the exchange if Zorro stops or crashes.
 - **Dead-man's switch (`SET_DEADMAN`) needs $1,000,000 of lifetime volume:** Hyperliquid refuses a scheduled cancel from any account that has traded less, so on most accounts, testnet included, the command returns -1 and logs the exchange's reason. It has only been tested up to that refusal. When it fires it cancels open orders, including the plugin's exchange-side stops, but leaves positions open; Hyperliquid allows 10 firings a day. Whether it also stops a running TWAP is not yet known.

@@ -142,6 +142,9 @@ fn flatten_base_balance(plugin: &state::PluginState, pair_name: &str, base_token
 fn logout_then_login_reconnects() {
     let first = login(None, BaseUrl::Testnet).expect("first login should succeed");
     assert!(state::get().is_some(), "state should be set after login");
+    // Bookkeeping only, nothing is sent: Zorro re-logs in by itself after a
+    // dropped connection and then polls and closes its trades by these ids.
+    let id = state::register_trade("ETH", 1, true, 3000.0, 0.01);
 
     state::clear();
     assert!(state::get().is_none(), "logout should drop the session");
@@ -149,7 +152,8 @@ fn logout_then_login_reconnects() {
     let second = login(None, BaseUrl::Testnet).expect("re-login should succeed");
     assert_eq!(first, second, "same key should give the same address");
     assert!(state::get().is_some(), "state should be set again");
-    println!("logout/re-login OK, address={second}");
+    assert!(state::get_trade(id).is_some(), "the re-login should carry trade {id} over");
+    println!("logout/re-login OK, address={second}, trade {id} carried over");
 }
 
 /// Verifies login and the read-only BrokerAsset/BrokerHistory2 paths. No orders.

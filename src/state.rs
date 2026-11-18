@@ -64,6 +64,29 @@ pub struct TradeInfo {
 }
 
 impl TradeInfo {
+    /// A freshly placed order: nothing closed, no fees read yet.
+    pub fn new(coin: &str, oid: u64, is_buy: bool, entry_price: f64, entry_sz: f64, lot: f64) -> Self {
+        TradeInfo {
+            coin: coin.to_string(),
+            oid,
+            is_buy,
+            entry_price,
+            entry_sz,
+            remaining_sz: entry_sz,
+            closed: false,
+            entry_fee: 0.0,
+            entry_fee_final: false,
+            entry_fee_in_coin: 0.0,
+            lot,
+            close_fees: 0.0,
+            pending_close_oids: Vec::new(),
+            stop_oid: None,
+            pending: false,
+            twap_id: None,
+            twap_running: false,
+        }
+    }
+
     /// Adds the fee of each pending close that `lookup` finds, once, and
     /// keeps waiting for the rest.
     pub fn settle_close_fees(&mut self, lookup: impl Fn(u64) -> Option<f64>) {
@@ -114,6 +137,9 @@ pub struct PluginState {
     pub info_client: InfoClient,
     pub exchange_client: ExchangeClient,
     pub address: Address,
+    /// Network of this session; trades carry over a re-login only to the
+    /// same account on the same network.
+    pub mainnet: bool,
     trades: Mutex<HashMap<i32, TradeInfo>>,
     /// Symbol -> universe/precision, so an order doesn't pay for a `meta()`
     /// round-trip. Cleared with the session, since it is network-specific.
@@ -139,6 +165,48 @@ static CALLBACKS: OnceLock<Callbacks> = OnceLock::new();
 // Each login leaks one PluginState; a handful per session is negligible,
 // and outstanding references from an in-flight call stay valid.
 static PLUGIN: RwLock<Option<&'static PluginState>> = RwLock::new(None);
+
+/// The trades of the session that last logged out, for the next login.
+/// Zorro logs out and back in by itself when the connection drops, and goes
+/// on managing its open trades by the same ids afterwards; dropping them at
+/// logout made every later close or poll of those trades fail.
+static CARRIED: Mutex<Option<Carried>> = Mutex::new(None);
+
+struct Carried {
+    address: Address,
+    mainnet: bool,
+    trades: HashMap<i32, TradeInfo>,
+}
+
+/// What a login does with the trades the last session left.
+#[derive(Debug, PartialEq)]
+pub enum Carryover {
+    /// Nothing was left.
+    None,
+    /// Same account and network: this many trades are carried over.
+    Kept(usize),
+    /// Another account or network: they cannot be this session's trades,
+    /// so this many are dropped.
+    Dropped(usize),
+}
+
+/// Decides whether the trades `carried` left by the last session belong to
+/// a login to `address` on `mainnet`.
+fn carry_over(
+    carried: Option<Carried>,
+    address: Address,
+    mainnet: bool,
+) -> (HashMap<i32, TradeInfo>, Carryover) {
+    match carried {
+        Some(c) if c.trades.is_empty() => (HashMap::new(), Carryover::None),
+        Some(c) if c.address == address && c.mainnet == mainnet => {
+            let n = c.trades.len();
+            (c.trades, Carryover::Kept(n))
+        }
+        Some(c) => (HashMap::new(), Carryover::Dropped(c.trades.len())),
+        None => (HashMap::new(), Carryover::None),
+    }
+}
 // Zorro wants a 6-digit-minimum trade id.
 static NEXT_TRADE_ID: AtomicI32 = AtomicI32::new(100_000);
 // Last SET_ORDERTYPE from Zorro: 0 = FOK, 1 = IOC, 2 = GTC, 4 = post-only
@@ -221,25 +289,45 @@ pub fn get() -> Option<&'static PluginState> {
     *PLUGIN.read().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Stores the logged-in clients, replacing any previous session.
-pub fn init(info_client: InfoClient, exchange_client: ExchangeClient, address: Address) {
+/// Stores the logged-in clients, replacing any previous session. Takes
+/// over the trades the last session left if it was the same account on the
+/// same network.
+pub fn init(
+    info_client: InfoClient,
+    exchange_client: ExchangeClient,
+    address: Address,
+    mainnet: bool,
+) -> Carryover {
+    let carried = CARRIED.lock().unwrap_or_else(|e| e.into_inner()).take();
+    let (trades, carryover) = carry_over(carried, address, mainnet);
     let state: &'static PluginState = Box::leak(Box::new(PluginState {
         info_client,
         exchange_client,
         address,
-        trades: Mutex::new(HashMap::new()),
+        mainnet,
+        trades: Mutex::new(trades),
         assets: Mutex::new(HashMap::new()),
         leverage: Mutex::new(HashMap::new()),
         funding: Mutex::new(None),
     }));
     *PLUGIN.write().unwrap_or_else(|e| e.into_inner()) = Some(state);
+    carryover
 }
 
 /// Drops the current session, so the next `BrokerLogin` reconnects from
 /// scratch (with whatever credentials/network Zorro supplies then) rather
-/// than silently reusing the old one.
+/// than silently reusing the old one. Its trades are kept aside for that
+/// login, which takes them over if it is the same account and network.
 pub fn clear() {
-    *PLUGIN.write().unwrap_or_else(|e| e.into_inner()) = None;
+    let Some(old) = PLUGIN.write().unwrap_or_else(|e| e.into_inner()).take() else {
+        return;
+    };
+    let trades = std::mem::take(&mut *old.trades.lock().unwrap_or_else(|e| e.into_inner()));
+    *CARRIED.lock().unwrap_or_else(|e| e.into_inner()) = Some(Carried {
+        address: old.address,
+        mainnet: old.mainnet,
+        trades,
+    });
 }
 
 /// Records a newly placed order, returns the Zorro-facing trade id.
@@ -253,26 +341,15 @@ pub fn register_trade(coin: &str, oid: u64, is_buy: bool, entry_price: f64, entr
             .unwrap_or_else(|e| e.into_inner())
             .insert(
             id,
-            TradeInfo {
-                coin: coin.to_string(),
+            TradeInfo::new(
+                coin,
                 oid,
                 is_buy,
                 entry_price,
                 entry_sz,
-                remaining_sz: entry_sz,
-                closed: false,
-                entry_fee: 0.0,
-                entry_fee_final: false,
-                entry_fee_in_coin: 0.0,
                 // the order was built against the resolved asset, so it is cached
-                lot: cached_asset(coin).map_or(DEFAULT_LOT, |a| a.lot_size()),
-                close_fees: 0.0,
-                pending_close_oids: Vec::new(),
-                stop_oid: None,
-                pending: false,
-                twap_id: None,
-                twap_running: false,
-            },
+                cached_asset(coin).map_or(DEFAULT_LOT, |a| a.lot_size()),
+            ),
         );
     }
     id
@@ -398,6 +475,53 @@ fn apply_close(remaining_sz: f64, entry_sz: f64, qty: f64) -> (f64, bool) {
 #[cfg(test)]
 mod tests {
     use super::{apply_close, request_leverage, set_symbol, take_leverage_request, take_symbol};
+    use super::{carry_over, Carried, Carryover, TradeInfo};
+    use alloy::primitives::Address;
+    use std::collections::HashMap;
+
+    fn trades(ids: &[i32]) -> HashMap<i32, TradeInfo> {
+        ids.iter()
+            .map(|&id| {
+                (id, TradeInfo::new("ETH", id as u64, true, 3000.0, 0.01, super::DEFAULT_LOT))
+            })
+            .collect()
+    }
+
+    fn left(address: Address, mainnet: bool, ids: &[i32]) -> Option<Carried> {
+        Some(Carried { address, mainnet, trades: trades(ids) })
+    }
+
+    /// Zorro re-logs in by itself after a dropped connection and goes on
+    /// closing its trades by their old ids; they must still be there.
+    #[test]
+    fn a_re_login_to_the_same_account_keeps_its_trades() {
+        let me = Address::repeat_byte(1);
+        let (kept, outcome) = carry_over(left(me, false, &[100_000, 100_004]), me, false);
+        assert_eq!(outcome, Carryover::Kept(2));
+        assert!(kept.contains_key(&100_000) && kept.contains_key(&100_004));
+    }
+
+    /// Another key, or Demo switched to Real: the old trades are not on
+    /// this account, and closing them there would trade the wrong one.
+    #[test]
+    fn a_login_to_another_account_or_network_drops_them() {
+        let me = Address::repeat_byte(1);
+        let other = Address::repeat_byte(2);
+        let (kept, outcome) = carry_over(left(me, false, &[100_000]), other, false);
+        assert_eq!(outcome, Carryover::Dropped(1));
+        assert!(kept.is_empty());
+        let (kept, outcome) = carry_over(left(me, false, &[100_000]), me, true);
+        assert_eq!(outcome, Carryover::Dropped(1));
+        assert!(kept.is_empty());
+    }
+
+    #[test]
+    fn nothing_left_is_nothing_to_report() {
+        let me = Address::repeat_byte(1);
+        assert_eq!(carry_over(None, me, false).1, Carryover::None);
+        assert_eq!(carry_over(left(me, false, &[]), me, false).1, Carryover::None);
+        assert_eq!(carry_over(left(me, false, &[]), me, true).1, Carryover::None);
+    }
 
     /// A SET_SYMBOL scopes one SET_LEVERAGE, and a held SET_LEVERAGE one
     /// order: neither may linger and steer a later one to the wrong asset.

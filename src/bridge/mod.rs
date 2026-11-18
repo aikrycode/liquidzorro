@@ -49,7 +49,16 @@ pub fn login(privkey: Option<&str>, base_url: BaseUrl) -> Result<alloy::primitiv
         Ok::<_, String>((info_client, exchange_client))
     })?;
 
-    state::init(info_client, exchange_client, address);
+    let mainnet = matches!(base_url, BaseUrl::Mainnet);
+    match state::init(info_client, exchange_client, address, mainnet) {
+        state::Carryover::None => {}
+        state::Carryover::Kept(n) => state::log_message(&format!(
+            "Hyperliquid: {n} trade(s) of the last session carried over"
+        )),
+        state::Carryover::Dropped(n) => state::log_message(&format!(
+            "Hyperliquid: {n} trade(s) of the last session dropped: they belong to another account or network"
+        )),
+    }
     // Live prices are an optimisation: without them every price comes over
     // HTTP as before, so a failed feed is logged, not a failed login.
     if let Err(e) = crate::feed::start(base_url) {
