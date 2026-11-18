@@ -9,23 +9,26 @@
 // Broker: Hyperliquid. User: blank. Password: your private key.
 // Demo = testnet. [Trade] mode only.
 //
-// Budget: holds at most ~$75 of testnet USDC at once and loses only
-// spread and fees (well under a dollar across a full run). Aborts
-// immediately if the account balance would drop under MIN_BALANCE.
+// Budget: holds at most ~$75 of testnet USDC at once. Spread and fees
+// cost cents, but each round trip also leaves just under one PURR it can
+// never sell (see below), about $5 a cycle. Aborts immediately if the
+// account balance would drop under MIN_BALANCE.
 //
-// Traded on FTEST/USDC ("@171"), which a testnet market maker quotes at
-// ~0.3% with ~$25,000 on each side, steady at ~$1.02, in 0.01-coin size
-// steps worth ~$0.01. The step size decides the cost: a spot buy pays its
-// fee in the coin, so every round trip leaves a fraction of a step that
-// can never be sold, and Hyperliquid sweeps it from the wallet within
-// minutes. On PURR/USDC, whose step is one whole coin, that was a whole coin per
-// cycle. The price matters too: Zorro's order size is an int, and at
-// 100000 lots a coin, $60 of a $0.002 coin overflows it.
+// Traded on PURR/USDC, the testnet spot pair that trades nearly every
+// minute. Hyperliquid has no candle for a minute without trades, so a
+// quiet pair leaves holes in Zorro's history: FTEST/USDC ("@171"), finer
+// at 0.01-coin steps, went days without a trade. PURR trades only in
+// whole coins, one lot each (LotAmount 1). A spot buy pays its fee in the
+// coin, so the trade holds a fraction under a whole number of coins; the
+// fraction can never be sold and stays in the wallet until Hyperliquid
+// sweeps it, so each cycle is measured from the position before its buy.
 // HYPE/USDC ("@1035") is unusable: it quotes a ~22% spread and ran from
 // $188 to $5480 inside two hours.
 
-#define HL_SYMBOL       "FTEST/USDC" // exchange symbol "@171", via the asset list
-#define ALT_SYMBOL      "BTC/USD"    // priced only -- too coarse to trade at this size
+#define HL_SYMBOL       "PURR/USDC"
+// Priced only, a second asset from the perp universe. BTC/USD ("@50")
+// went a day without a trade, so without a bar.
+#define ALT_SYMBOL      "ETH-PERP"
 #define MIN_BALANCE     750          // hard floor; abort rather than spend past this
 // Per cycle, split in three. Every chunk must clear the exchange's $10
 // minimum at its slippage-adjusted price, 5% under the bid, so the
@@ -40,14 +43,14 @@
 // 100000 for assets traded in fractions, 1 for those traded only in whole
 // coins. The plugin refuses an entry whose LotAmount does not match.
 #define AMOUNT_SCALE    (1./LotAmount)
-// One exchange size step for HL_SYMBOL: FTEST has szDecimals 2, so it
-// trades in 0.01 coins, which is 1000 lots. Less than this cannot be sold
+// One exchange size step for HL_SYMBOL: PURR has szDecimals 0, so it
+// trades in whole coins, which is 1 lot. Less than this cannot be sold
 // at all, so it is the floor a close can reach, not a tolerance.
-#define DUST_THRESHOLD_LOTS 1000.
+#define DUST_THRESHOLD_LOTS 1.
 // A sweep that stops making progress would otherwise retry forever.
 #define MAX_SWEEPS      3
 // One size step, the unit chunks are cut in.
-#define STEP_LOTS       1000.
+#define STEP_LOTS       1.
 
 // BrokerCommand codes (trading.h)
 #define CMD_GET_POSITION   53
@@ -76,6 +79,7 @@ int Cycle;
 int Passed, Failed;
 var Chunk1, Chunk2, Chunk3;
 var StartBalance;
+var PositionAtStart;     // coins the account held before the run
 var PositionBeforeBuy;
 var PositionBeforeReject;
 int LimitTradeID;
@@ -218,7 +222,7 @@ function run()
 
 		asset(ALT_SYMBOL);
 		AltPrice = priceClose(0);
-		check("BrokerAsset prices a second asset (BTC/USD)", AltPrice > 0);
+		check("BrokerAsset prices a second asset (ETH-PERP)", AltPrice > 0);
 		asset(HL_SYMBOL);   // back to the trading asset
 
 		// --- candle history ---
@@ -240,7 +244,8 @@ function run()
 		check("The price history has no gap of 30 minutes or more", MaxGap < 30);
 
 		// --- starting position ---
-		printf("\nPosition before start: %.0f lots", heldLots());
+		PositionAtStart = heldLots();
+		printf("\nPosition before start: %.0f lots", PositionAtStart);
 
 		printf("\n--- market round trips (%d cycles) ---", CYCLES);
 		Phase = PH_BUY;
@@ -268,10 +273,11 @@ function run()
 	}
 
 	if(Phase == PH_AWAIT_FILL) {
-		var Held = heldLots();
-		// measured against the pre-buy position, so a leftover balance from
-		// an earlier run can't make a failed buy look successful
-		check("Market buy reaches the exchange", Held > PositionBeforeBuy);
+		// What this buy added. Measured against the pre-buy position, so a
+		// leftover from an earlier cycle or run can't make a failed buy
+		// look successful, nor be sold as if it were part of this trade.
+		var Held = heldLots() - PositionBeforeBuy;
+		check("Market buy reaches the exchange", Held > 0);
 		if(Held <= DUST_THRESHOLD_LOTS) {      // nothing to sell; skip to next cycle
 			Phase = PH_CYCLE_END;
 			return;
@@ -279,11 +285,13 @@ function run()
 		// Uneven split in whole size steps: a fractional chunk is floored by
 		// the plugin, and on a coarse pair that can take it under the $10
 		// minimum (one run had such a close refused dozens of times).
-		// The last chunk takes the remainder, fractions and all, so it
-		// closes the whole trade and the plugin retires the sliver with it.
+		// The last chunk takes the remainder, rounded up, so it closes the
+		// whole trade and the plugin retires the sliver with it. Zorro cuts
+		// a lot count to a whole number: 4.99 lots of PURR went out as 4,
+		// a partial close that left the trade open.
 		Chunk1 = floor(Held*0.4/STEP_LOTS)*STEP_LOTS;
 		Chunk2 = floor(Held*0.3/STEP_LOTS)*STEP_LOTS;
-		Chunk3 = Held - Chunk1 - Chunk2;
+		Chunk3 = ceil(Held - Chunk1 - Chunk2);
 		printf("\n[cycle %d] filled %.0f lots; selling %.0f / %.0f / %.0f",
 			Cycle+1, Held, Chunk1, Chunk2, Chunk3);
 		Phase = PH_SELL_A;
@@ -297,7 +305,7 @@ function run()
 	if(Phase == PH_SWEEP) {
 		var Leftover;
 		noteSale();
-		Leftover = heldLots();
+		Leftover = heldLots() - PositionBeforeBuy;   // what is left of this cycle's buy
 		if(Leftover > DUST_THRESHOLD_LOTS && SweepsLeft > 0) {
 			SweepsLeft--;
 			printf("\n[cycle %d] sweeping leftover: %.0f lots (%d tries left)",
@@ -410,7 +418,7 @@ function run()
 	}
 
 	if(Phase == PH_REPORT) {
-		var EndBalance, Held;
+		var EndBalance, Held, Gained;
 		int Stranded = 0;
 
 		// Safety net: never leave a resting order behind holding collateral,
@@ -432,6 +440,12 @@ function run()
 			abs(Held - PositionBeforeReject) <= DUST_THRESHOLD_LOTS);
 		check("Plugin still responds after a rejection", Held >= 0);
 		check("Zorro holds no open trades at the end", openTrades() == 0);
+		// Coins the account owned before the run are not this run's
+		// leftovers. Each close sells whole coins, topping up the fee's
+		// sliver from them, so the run should end no richer in coins.
+		Gained = Held - PositionAtStart;
+		check("The run leaves no more coins than it started with",
+			Gained <= DUST_THRESHOLD_LOTS);
 		check("Balance stayed above the floor", EndBalance >= MIN_BALANCE);
 		// Spot pays a taker fee on every fill. Zero here would mean
 		// Zorro's P&L is gross and the cost never reached it.
@@ -441,10 +455,10 @@ function run()
 		printf("\n=== RESULT: %d passed, %d failed ===", Passed, Failed);
 		printf("\nBalance %.2f -> %.2f (cost %.2f USDC)",
 			StartBalance, EndBalance, StartBalance - EndBalance);
-		if(Held > DUST_THRESHOLD_LOTS)
-			printf("\n!! WARNING: %.0f lots still held -- rerun to flatten", Held);
-		else if(Held > 0)
-			printf("\nDust remaining: %.0f lots -- under one size step, unsellable", Held);
+		if(Gained > DUST_THRESHOLD_LOTS)
+			printf("\n!! WARNING: %.2f lots more than at the start -- rerun to flatten", Gained);
+		else if(Gained > 0)
+			printf("\nDust remaining: %.2f lots -- under one size step, unsellable", Gained);
 
 		Phase = PH_DONE;
 		return;
