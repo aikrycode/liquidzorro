@@ -52,8 +52,12 @@ ALIASES = {
     "perp": "HyperliquidPerpStressTest",
 }
 # Minutes a Zorro run may take before it is stopped.
-TIMEOUTS = {"HyperliquidProbe": 5, "HyperliquidStressTest": 15, "HyperliquidPerpStressTest": 30}
-DEFAULT_TIMEOUT = 30
+# Measured: spot ~20, perp ~45; a stress test waits for bars, so it cannot
+# be hurried. Each limit leaves 15 minutes beyond a slow run.
+TIMEOUTS = {"HyperliquidProbe": 5, "HyperliquidStressTest": 55, "HyperliquidPerpStressTest": 75}
+DEFAULT_TIMEOUT = 75
+# Live tests that clear what a cut-short run leaves on the exchange.
+CLEANUP = ["cancels_leftover_orders", "stops_leftover_twaps", "flattens_leftover_balance"]
 # A session is over when its "Logout.." has been followed by this much quiet.
 SETTLE_S = 15
 KEY_ENV = "HL_TESTNET_PRIVKEY"
@@ -530,7 +534,14 @@ def main(argv=None) -> int:
     if skipped:
         say(f"   ({skipped} stage(s) not run)")
     if maybe_open:
-        say("   a run was cut short: check the account for open positions and orders")
+        # Zorro was closed with its trades open (AutoConfirm leaves them).
+        say("\n== a run was cut short: clearing leftovers on testnet")
+        for test in CLEANUP:
+            args = ["test", "--lib", "--", "--ignored", "--test-threads=1", "--exact", f"bridge::tests::{test}"]
+            code, reasons = run_cargo(args, key, f"cleanup:{test}")
+            report(f"cleanup:{test}", code, reasons)
+            if code != EXIT_PASS:
+                say("   cleanup failed: check the account for open positions and orders")
     return worst
 
 
