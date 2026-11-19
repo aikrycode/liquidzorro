@@ -209,7 +209,10 @@ pub unsafe extern "C" fn BrokerAsset(
             *p_pip_cost = pip * lot;
         }
         if !p_min_amount.is_null() {
-            *p_min_amount = 0.0;
+            // Zorro's LotAmount: coins in one lot. In live trading Zorro
+            // takes it from here over the asset list, so a list with the
+            // wrong value no longer gets entries refused.
+            *p_min_amount = lot;
         }
         if !p_margin_cost.is_null() {
             // Margin required per lot. Spot is fully collateralized; a perp
@@ -512,6 +515,12 @@ const SET_SYMBOL: c_int = 132;
 /// Returns the leverage, or 0 if refused (logged).
 const SET_LEVERAGE: c_int = 140;
 
+/// EXPORT_ASSETS (plugin-specific): write an asset list of every perp and
+/// spot pair on the network logged in to, from the exchange's own data, to
+/// the file named in `parameter` (`char*`, relative to Zorro's folder).
+/// Returns the number of assets written, 0 on failure (logged).
+const EXPORT_ASSETS: c_int = 4001;
+
 /// Unhandled codes return 0, which Zorro reads as "unsupported".
 #[no_mangle]
 pub unsafe extern "C" fn BrokerCommand(command: c_int, parameter: isize) -> f64 {
@@ -631,6 +640,19 @@ pub unsafe extern "C" fn BrokerCommand(command: c_int, parameter: isize) -> f64 
                     state::log_message(&format!(
                         "BrokerCommand(DO_MODIFY, {trade_id}) FAILED: {e}"
                     ));
+                    0.0
+                }
+            }
+        }
+        EXPORT_ASSETS => {
+            let Some(path) = read_cstr(parameter as *const c_char).filter(|p| !p.is_empty()) else {
+                state::log_message("BrokerCommand(EXPORT_ASSETS): no file name");
+                return 0.0;
+            };
+            match bridge::export_assets(path) {
+                Ok(n) => n as f64,
+                Err(e) => {
+                    state::log_message(&format!("BrokerCommand(EXPORT_ASSETS) FAILED: {e}"));
                     0.0
                 }
             }

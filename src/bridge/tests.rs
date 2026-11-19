@@ -156,6 +156,41 @@ fn logout_then_login_reconnects() {
     println!("logout/re-login OK, address={second}, trade {id} carried over");
 }
 
+/// EXPORT_ASSETS writes every perp and spot pair, with the same lot and
+/// PIP the plugin trades with. No orders.
+#[test]
+#[ignore]
+fn exports_the_asset_list() {
+    login(None, BaseUrl::Testnet).expect("login should succeed");
+    let path = std::env::temp_dir().join("liquidzorro_assets_export.csv");
+    let path = path.to_str().unwrap();
+    let n = export_assets(path).expect("export should succeed");
+    let text = std::fs::read_to_string(path).unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), n + 1, "a header and one line per asset");
+    for line in lines.iter().take(4) {
+        println!("{line}");
+    }
+    for symbol in ["ETH", "PURR/USDC", TEST_SPOT] {
+        let row = lines
+            .iter()
+            .find(|l| l.ends_with(&format!(",{symbol}")))
+            .unwrap_or_else(|| panic!("no row for {symbol}"));
+        println!("{row}");
+        let fields: Vec<&str> = row.split(',').collect();
+        assert_eq!(fields.len(), 12, "{row}");
+        let pip: f64 = fields[5].parse().unwrap();
+        let lot: f64 = fields[9].parse().unwrap();
+        assert_eq!(pip, super::pip(symbol).unwrap(), "{symbol} PIP");
+        assert_eq!(lot, lot_size(symbol).unwrap(), "{symbol} LotAmount");
+        assert!(fields[1].parse::<f64>().unwrap() > 0.0, "{symbol} price");
+        assert!(fields[10].parse::<f64>().unwrap() <= 0.0, "{symbol} commission is a negative percent");
+    }
+    let names: std::collections::HashSet<&str> = lines[1..].iter().map(|l| l.split(',').next().unwrap()).collect();
+    assert_eq!(names.len(), n, "asset names are unique");
+    println!("exported {n} assets");
+}
+
 /// Verifies login and the read-only BrokerAsset/BrokerHistory2 paths. No orders.
 #[test]
 #[ignore]

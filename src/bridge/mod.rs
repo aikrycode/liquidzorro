@@ -2180,6 +2180,9 @@ pub use deadman::{
 };
 
 mod twap;
+
+mod export;
+pub use export::export_assets;
 pub use twap::{minutes as twap_minutes, set_minutes as set_twap_minutes};
 #[cfg(test)]
 use twap::{cancel_by_id as cancel_twap_by_id, running_twaps};

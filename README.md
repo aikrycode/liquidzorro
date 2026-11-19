@@ -28,7 +28,7 @@ liquidzorro.dll  (Rust cdylib, in Zorro's Plugin64\ folder)
    |               over a REST request today; streaming (WS) caching is a later
    |               optimization once polling performance needs it
    +-- hyperliquid-rust-sdk (path dependency) -- InfoClient + ExchangeClient
-   +-- assets   -- (later) Hyperliquid spot asset universe <-> Zorro asset list
+   +-- assets   -- perp or spot, and each asset's lot, price step and rounding
    +-- state    -- logged-in clients + open-trade bookkeeping + Zorro's callbacks
 ```
 
@@ -43,7 +43,8 @@ liquidzorro.dll  (Rust cdylib, in Zorro's Plugin64\ folder)
 | `src/bridge/tests.rs` | `#[ignore]`d live smoke tests against Hyperliquid testnet, named by what they verify (see Local setup). |
 | `src/state.rs` | Shared plugin state: the logged-in `InfoClient`/`ExchangeClient`/wallet address, open-trade bookkeeping (Zorro trade id -> Hyperliquid `oid`), and the `fpError`/`fpProgress` callback pointers captured in `BrokerOpen` (used to report messages back to Zorro instead of stdout). |
 | `src/runtime.rs` | Owns the single lazily-started Tokio runtime used to drive the async SDK from Zorro's blocking calls. |
-| `src/assets.rs` | Placeholder for a later pass: mapping Hyperliquid's spot asset universe to Zorro's expected asset list format (tick size, real spread) instead of the `BrokerAsset` placeholders currently in `ffi.rs`. |
+| `src/assets.rs` | Resolves a symbol to the perp or spot universe and derives its lot, price step (`PIP`) and price rounding from the exchange's size decimals. |
+| `src/bridge/export.rs` | `EXPORT_ASSETS`: writes a Zorro asset list of every perp and spot pair from the exchange's own data. |
 | `tests/ffi_harness.rs` | Loads the compiled `liquidzorro.dll` dynamically and calls every export through its real C signature with real raw pointers and callback functions -- the only test that exercises the actual FFI boundary the way Zorro will, rather than calling our Rust functions directly. Network-free (runs with `cargo test`, no `--ignored` needed). |
 
 Every exported function in `ffi.rs` is also wrapped in a panic guard: since an unwinding Rust panic crossing an `extern "C"` boundary is undefined behavior, any unexpected panic is caught and turned into an ordinary failure return (logged via the error callback) instead of risking a crash of Zorro's whole process.
@@ -92,7 +93,7 @@ cargo test --lib -- --ignored --nocapture
 3. **Launch Zorro.** It scans the plugin folder and lists what it finds -- ours appears as `Hyperliquid` in the **Broker** dropdown.
 4. **Select "Hyperliquid".** User: blank. Password: your private key (`0x...`); copy-paste it into the Password field as-is, mind its exact length. Demo/Real toggle selects testnet/mainnet directly via `BrokerLogin` -- start with Demo.
 5. **Trigger login** (enter Trade or Test mode) and watch the message window -- that's where `BrokerLogin` reports success or failure.
-6. **Copy the asset list.** Put `AssetsHyperliquid.csv` and `Accounts.csv` (both in `examples\`) into `History\`. They point the Hyperliquid accounts at the right asset list and login settings.
+6. **Copy the asset list.** Put `AssetsHyperliquid.csv` and `Accounts.csv` (both in `examples\`) into `History\`. They point the Hyperliquid accounts at the right asset list and login settings. For a list of every perp and spot pair on the network, have the plugin write one: see [Exporting the asset list](#exporting-the-asset-list).
 7. **In `Zorro.ini`, set `AutoConfirm = 1`,** then restart Zorro. This stops Zorro prompting to close trades when you press `[Stop]`; the strategies close their own positions, so the prompt is never needed.
 
 You can switch between Demo and Real, or paste a different key, and press `[Trade]` again without restarting Zorro -- the plugin reconnects on each login.
@@ -146,7 +147,7 @@ Zorro passes order sizes as a 32-bit count of lots, so one lot has to be a fract
 
 - **Size orders from `LotAmount`, never from a constant:** `Lots = ceil(Usd/priceClose()/LotAmount);`. The example scripts define `AMOUNT_SCALE` as `1./LotAmount` for this.
 - **Positions and fills are in the same lots:** `GET_POSITION` and Zorro's `TradeLots` count lots of the asset, so divide by `AMOUNT_SCALE` for coins.
-- **A wrong `LotAmount` is refused, not traded:** Zorro sends `LotAmount` before every order, and the plugin refuses an entry whose value does not match its own lot. The log names the right value, e.g. `set LotAmount 1 in the asset list`. Closes go ahead, since they are sized from the trade.
+- **A wrong `LotAmount` is refused, not traded:** Zorro sends `LotAmount` before every order, and the plugin refuses an entry whose value does not match its own lot. The log names the right value, e.g. `set LotAmount 1 in the asset list`. Closes go ahead, since they are sized from the trade. An [exported asset list](#exporting-the-asset-list) has the right value for every asset, and the plugin also reports it to Zorro through `BrokerAsset`.
 - **With 0.00001 a single order holds at most about 21,000 coins** -- ample for coins traded in fractions, which are priced well above a cent.
 
 ### Prices
@@ -180,6 +181,18 @@ Zorro passes order sizes as a 32-bit count of lots, so one lot has to be a fract
 | `DO_MODIFY` | 2001 | `var[3]`: trade id, new limit, new lots (0 keeps the size) | 1 if the order rests at the new price, 0 if refused -- always for a move through the book |
 | `SET_TWAP` | 2002 | minutes, 5-1440; 0 off | the minutes, -1 if out of range |
 | `SET_DEADMAN` | 2003 | seconds, 30-86400; 0 off | the seconds, -1 if refused |
+| `EXPORT_ASSETS` | 4001 | file name, relative to Zorro's folder | the number of assets written, 0 on failure |
+
+### Exporting the asset list
+
+`brokerCommand(4001, "History\\AssetsHyperliquidAll.csv");` after login writes an asset list in Zorro's own format, built from the exchange's data for the network logged in to (Demo: testnet, Real: mainnet). To use it, name it in `Accounts.csv` or with `assetList`. Each row is:
+
+- **Every perp and spot pair with a price:** perps as `ETH-PERP` with symbol `ETH`, spot pairs by their tokens, e.g. `HYPE/USDC` with symbol `@1035`. A name Zorro cannot take -- over 15 characters, blanks, or already used -- becomes `PERP_<index>` or `SPOT_<index>`.
+- **`PIP`, `PIPCost` and `LotAmount`** as the plugin trades the asset, so no entry is refused for a wrong lot.
+- **`MarginCost` of -100, i.e. 1x:** Zorro derives the leverage it sends (`SET_LEVERAGE`) from it. For leverage, set it per asset, e.g. -20 for 5x.
+- **`RollLong`/`RollShort`:** a perp's funding at the current rate, per lot per day; 0 for spot.
+- **`Commission`:** the account's taker rate, both ways, as a negative percent of the trade value.
+- **`Price`, `Spread`, funding:** a snapshot at the time of the export, for backtests; live trading reads them from the exchange.
 
 ### Settings
 
@@ -210,7 +223,8 @@ This address only ever changes in a signed commit -- before sending, check that 
 - **TWAP entries (`SET_TWAP`) must be sent as GTC:** wrap the entry in `setf(TradeMode, TR_GTC)` ... `resf(TradeMode, TR_GTC)`. A TWAP starts with nothing filled, and Zorro only keeps polling a GTC order; sent any other way it would book 0 lots and never see the slices, so the plugin refuses it. TWAPs are perps only, at least $100, 5-1440 minutes, and carry no stop. A TWAP keeps slicing on the exchange if Zorro stops or crashes.
 - **Dead-man's switch (`SET_DEADMAN`) needs $1,000,000 of lifetime volume:** Hyperliquid refuses a scheduled cancel from any account that has traded less, so on most accounts, testnet included, the command returns -1 and logs the exchange's reason. It has only been tested up to that refusal. When it fires it cancels open orders, including the plugin's exchange-side stops, but leaves positions open; Hyperliquid allows 10 firings a day. Whether it also stops a running TWAP is not yet known.
 - **`DO_MODIFY` cannot move an order through the book:** Hyperliquid places the modified order as post-only whatever it was, and cancels the original before refusing a replacement that would trade at once. The plugin therefore refuses such a move itself (returns 0, logged) and the order keeps resting; to trade at once, cancel it and send a market order.
-- **`LotAmount` depends on the asset:** `0.00001` for assets traded in fractions of a coin, `1` for those traded only in whole coins (PURR/USDC, kPEPE and most coins under a cent). An asset list with the old `0.00001` for a whole-coin asset gets its entries refused, with the right value in the log; see [Lot size](#lot-size).
+- **`LotAmount` depends on the asset:** `0.00001` for assets traded in fractions of a coin, `1` for those traded only in whole coins (PURR/USDC, kPEPE and most coins under a cent). A hand-written asset list with the old `0.00001` for a whole-coin asset gets its entries refused, with the right value in the log; an [exported list](#exporting-the-asset-list) has the right value for every asset. See [Lot size](#lot-size).
+- **An exported asset list's spread is rough:** a perp's is the exchange's impact spread, what an order of its impact size pays to cross the book, which is wider than the best bid and ask -- several tenths of a percent on testnet. Spot pairs get no spread. Backtests on the list are pessimistic on perps and optimistic on spot; live trading reads the real spread from the book. HIP-3 perps are not exported.
 - **A close fee can arrive late:** Hyperliquid's fills feed indexes a fill a moment after the order reports it. The plugin waits up to about 2 seconds for a close's fee; on a partial close one still missing is added on a later poll, but a trade closed in full is booked without it and the log says so (`the fee of close order ... is not indexed yet`).
 - **A quiet market's history is filled with flat bars:** Hyperliquid has no candle for a minute without trades, and Zorro's bars follow every asset loaded, so one quiet pair used to end the lookback where it stopped trading. The plugin now gives every such minute a bar at the last close with zero volume, up to the last closed bar, and starts a window with no trades from the last close before it. Those bars show no movement, so an indicator on a pair that rarely trades sees a flat line. Long quiet stretches are still logged (`history(...): out of date`, `... min of bars missing`, `no bars in the window`, each with `filled with flat bars at the last close`). A pair with no trade in the 5000 bars before the window gets no bars.
 - **`SET_LEVERAGE` with no `SET_SYMBOL` right before it waits for the next order:** Zorro sends `SET_LEVERAGE` by itself before every order, without naming the asset, so the plugin holds it and sets it on the asset of the next order (an entry is not placed if that leverage is refused; a close goes ahead). Right after a `SET_SYMBOL` it is set on that asset at once, and the `SET_SYMBOL` is used up. Until the next order, `BrokerAsset` still reports margin at the old leverage.

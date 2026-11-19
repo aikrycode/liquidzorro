@@ -56,6 +56,11 @@
 #define CMD_GET_POSITION   53
 #define CMD_SET_ORDERTYPE  157
 #define CMD_DO_CANCEL      301
+// EXPORT_ASSETS (plugin-specific): writes every perp and spot pair to an
+// asset list, from the exchange's own data. Written to Log, so the run
+// leaves History alone.
+#define CMD_EXPORT_ASSETS  4001
+#define EXPORT_FILE        "Log\\AssetsHyperliquidExport.csv"
 #define ORDERTYPE_GTC      2
 #define ORDERTYPE_IOC      1
 
@@ -88,8 +93,36 @@ var LimitResting;     // price the resting order carries, per Zorro
 int LimitPollsLeft;
 int LimitCancelled;
 int SweepsLeft;
+var Exported;        // assets EXPORT_ASSETS wrote
 var BeforeSell;      // position before the last partial close, 0 once checked
 int SellMisses;      // partial closes this cycle that sold nothing
+
+// Whether the exported list's row for the current asset has the PIP and
+// LotAmount Zorro trades it with. Both come from the plugin in live
+// trading, so a list that disagrees would backtest at the wrong lot.
+int exportMatches()
+{
+	string Content = file_content(EXPORT_FILE);
+	if(!Content) {
+		printf("\n        (%s not found)", EXPORT_FILE);
+		return 0;
+	}
+	string Row = strstr(Content, strf("\n%s,", Asset));
+	if(!Row) {
+		printf("\n        (no row for %s)", Asset);
+		return 0;
+	}
+	// sscanf reads floats: Price, Spread, RollLong, RollShort, PIP,
+	// PIPCost, MarginCost, Market, Multiplier
+	float F[9];
+	int Read = sscanf(Row + strlen(Asset) + 2, "%f,%f,%f,%f,%f,%f,%f,%f,%f",
+		&F[0], &F[1], &F[2], &F[3], &F[4], &F[5], &F[6], &F[7], &F[8]);
+	printf("\n%s exported: PIP %.8f LotAmount %.5f (Zorro: %.8f, %.5f)",
+		Asset, (var)F[4], (var)F[8], PIP, LotAmount);
+	return Read == 9
+		&& abs(F[4] - PIP) <= PIP*0.0001
+		&& abs(F[8] - LotAmount) <= LotAmount*0.0001;
+}
 
 void check(string Name, int Ok)
 {
@@ -245,6 +278,14 @@ function run()
 			MaxGap = max(MaxGap, (wdate(i) - wdate(i+1))*1440);
 		printf("\nWidest step between bars: %.0f min", MaxGap);
 		check("The price history has a bar for every minute", MaxGap < 1.5);
+
+		// An asset list typed by hand had the wrong LotAmount for whole-coin
+		// assets, and every entry was refused. The plugin now writes one
+		// from the exchange's own data, and reports LotAmount to Zorro.
+		Exported = brokerCommand(CMD_EXPORT_ASSETS, EXPORT_FILE);
+		printf("\nExported %.0f assets to %s", Exported, EXPORT_FILE);
+		check("EXPORT_ASSETS writes the exchange's asset list", Exported > 100);
+		check("The exported list has the PIP and LotAmount Zorro trades with", exportMatches());
 
 		// --- starting position ---
 		PositionAtStart = heldLots();
