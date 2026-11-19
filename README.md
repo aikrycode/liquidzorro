@@ -76,6 +76,24 @@ cargo test --lib -- --ignored --nocapture
 
 `connects_and_reads_market_data` is read-only (spot_meta/all_mids/candles_snapshot) and never spends anything. `logout_then_login_reconnects` checks that logging out actually drops the session and the next login reconnects -- also read-only. `places_and_closes_a_spot_order` places and immediately closes an order sized just above Hyperliquid's $10 minimum notional, sweeping any partial-fill leftover afterward -- it does spend a little testnet USDC, but only slippage is lost (a few cents), since the round trip returns the rest. `flattens_leftover_balance` is a standalone cleanup if a prior run ever leaves a position open. All need a funded testnet wallet per the steps above.
 
+### Running the Zorro tests unattended
+
+`tests/zorro/zorrorun.py` builds the plugin, deploys it into Zorro, runs the checks given, and reads their results (Windows, Python 3.10+, no packages):
+
+```powershell
+python tests/zorro/zorrorun.py --deploy unit probe spot:27 perp:58
+```
+
+- **Stages**, run in order:
+  - `unit` is `cargo test`;
+  - `live:<test>` is one of the `#[ignore]`d live tests;
+  - `probe` logs in through Zorro and prices one asset, with no orders;
+  - `spot` and `perp` are the stress tests, and they trade on testnet.
+
+  `:<n>` is the number of checks that must pass. The exit code is 0 only if every stage passed.
+- **Settings** come from `.env`: `HL_TESTNET_PRIVKEY`, and `ZORRO_DIR` for the Zorro folder. The key reaches Zorro only through its environment, and keys and addresses are blanked in the output.
+- **Free Zorro ignores `-trade`,** so the runner does what you would: it opens Zorro on the script, selects Hyperliquid and Demo, checks that Login and Password are blank, and presses [Trade]. It stops Zorro at once if it sees a mainnet login.
+- **Zorro must be closed first,** since it locks the DLL. `--close-zorro` closes it.
 
 ## Installing and running inside Zorro
 
