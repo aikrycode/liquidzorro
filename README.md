@@ -76,6 +76,7 @@ cargo test --lib -- --ignored --nocapture
 
 `connects_and_reads_market_data` is read-only (spot_meta/all_mids/candles_snapshot) and never spends anything. `logout_then_login_reconnects` checks that logging out actually drops the session and the next login reconnects -- also read-only. `places_and_closes_a_spot_order` places and immediately closes an order sized just above Hyperliquid's $10 minimum notional, sweeping any partial-fill leftover afterward -- it does spend a little testnet USDC, but only slippage is lost (a few cents), since the round trip returns the rest. `flattens_leftover_balance` is a standalone cleanup if a prior run ever leaves a position open. All need a funded testnet wallet per the steps above.
 
+
 ## Installing and running inside Zorro
 
 > Verified against a live Zorro 3.1.1.2 session on the 32-bit `Zorro.exe` + Lite-C path: plugin load, login/logout/re-login, price and history reads, and a full buy / sell / sell round trip on Hyperliquid testnet. For the 64-bit path see [Known Issues](#known-issues).
@@ -91,7 +92,7 @@ cargo test --lib -- --ignored --nocapture
    ```
    Zorro64 loads plugins from `Plugin64\`; 32-bit `Zorro.exe` uses `Plugin\` and needs its own 32-bit build (`cargo build --release --target i686-pc-windows-msvc`).
 3. **Launch Zorro.** It scans the plugin folder and lists what it finds -- ours appears as `Hyperliquid` in the **Broker** dropdown.
-4. **Select "Hyperliquid".** User: blank. Password: your private key (`0x...`); copy-paste it into the Password field as-is, mind its exact length. Demo/Real toggle selects testnet/mainnet directly via `BrokerLogin` -- start with Demo.
+4. **Select "Hyperliquid".** User: blank. Password: your private key (`0x...`); copy-paste it into the Password field as-is, mind its exact length. Demo/Real toggle selects testnet/mainnet directly via `BrokerLogin` -- start with Demo. On Demo only, a blank Password uses `HL_TESTNET_PRIVKEY` from Zorro's environment instead, for unattended test runs; on Real a blank Password fails the login.
 5. **Trigger login** (enter Trade or Test mode) and watch the message window -- that's where `BrokerLogin` reports success or failure.
 6. **Copy the asset list.** Put `AssetsHyperliquid.csv` and `Accounts.csv` (both in `examples\`) into `History\`. They point the Hyperliquid accounts at the right asset list and login settings. For a list of every perp and spot pair on the network, have the plugin write one: see [Exporting the asset list](#exporting-the-asset-list).
 7. **In `Zorro.ini`, set `AutoConfirm = 1`,** then restart Zorro. This stops Zorro prompting to close trades when you press `[Stop]`; the strategies close their own positions, so the prompt is never needed.
@@ -218,6 +219,7 @@ This address only ever changes in a signed commit -- before sending, check that 
 ## Known Issues
 
 - **Spot leftovers under one size step are lost:** a Hyperliquid spot buy pays its fee in the coin bought, so closing the trade always leaves a fraction of one size step that no order can sell. The plugin closes the trade anyway and books that fraction as a loss, because Hyperliquid sweeps such balances from the wallet -- on testnet within minutes, with nothing returned. On fine-stepped pairs this is a fraction of a cent; on PURR/USDC, which trades in whole coins, it is up to one coin (~$4.50) per trade. If the account already holds some of the coin, the close sells the whole step anyway and the shortfall comes out of those coins, so nothing is lost.
+- **`HL_TESTNET_PRIVKEY` works on testnet only:** a blank Password falls back to it on Demo, but on Real the login fails with `mainnet needs the key in the Password field`. This keeps a run started with the key in its environment, and the account left on Real, from trading real funds.
 - **A Zorro restart loses the plugin's trades:** the plugin keeps open trades across a logout and login in the same Zorro session, but not across a restart of Zorro, so the strategies set `SaveMode = 0` and start flat. Positions and resting orders stay on the exchange and have to be closed there or by a new order.
 - **64-bit Zorro needs Zorro S:** Zorro64 has no Lite-C compiler and runs only C++ strategies, and without a Zorro S licence it refuses to start them ("Error 063: C++ direct start requires Zorro S"), even precompiled. The plugin itself loads there and appears in the Broker dropdown. Without Zorro S, use the 32-bit `Zorro.exe` with Lite-C, which is verified end to end.
 - **TWAP entries (`SET_TWAP`) must be sent as GTC:** wrap the entry in `setf(TradeMode, TR_GTC)` ... `resf(TradeMode, TR_GTC)`. A TWAP starts with nothing filled, and Zorro only keeps polling a GTC order; sent any other way it would book 0 lots and never see the slices, so the plugin refuses it. TWAPs are perps only, at least $100, 5-1440 minutes, and carry no stop. A TWAP keeps slicing on the exchange if Zorro stops or crashes.

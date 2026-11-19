@@ -19,16 +19,13 @@ use crate::{runtime, state};
 
 const TESTNET_PRIVKEY_ENV: &str = "HL_TESTNET_PRIVKEY";
 
-/// Logs in with `privkey` (falls back to `HL_TESTNET_PRIVKEY` for dev use)
-/// against `base_url`. Replaces any previous session, so a `[Stop]` /
+/// Logs in with `privkey` (falls back to `HL_TESTNET_PRIVKEY` on testnet,
+/// for dev use) against `base_url`. Replaces any previous session, so a `[Stop]` /
 /// `[Trade]` cycle within one Zorro process reconnects with whatever
 /// credentials and network are set at that point.
 pub fn login(privkey: Option<&str>, base_url: BaseUrl) -> Result<alloy::primitives::Address, String> {
-    let privkey = match privkey {
-        Some(k) if !k.is_empty() => k.to_string(),
-        _ => env::var(TESTNET_PRIVKEY_ENV)
-            .map_err(|_| "no password supplied and HL_TESTNET_PRIVKEY is not set".to_string())?,
-    };
+    let mainnet = matches!(base_url, BaseUrl::Mainnet);
+    let privkey = choose_key(privkey, mainnet, env::var(TESTNET_PRIVKEY_ENV).ok())?;
     let wallet: PrivateKeySigner = privkey
         .parse()
         .map_err(|e| format!("invalid private key: {e}"))?;
@@ -49,7 +46,6 @@ pub fn login(privkey: Option<&str>, base_url: BaseUrl) -> Result<alloy::primitiv
         Ok::<_, String>((info_client, exchange_client))
     })?;
 
-    let mainnet = matches!(base_url, BaseUrl::Mainnet);
     match state::init(info_client, exchange_client, address, mainnet) {
         state::Carryover::None => {}
         state::Carryover::Kept(n) => state::log_message(&format!(
@@ -65,6 +61,46 @@ pub fn login(privkey: Option<&str>, base_url: BaseUrl) -> Result<alloy::primitiv
         state::log_message(&format!("Hyperliquid: {e}; prices will be polled instead"));
     }
     Ok(address)
+}
+
+/// The key to log in with: the Password field's, or else, on testnet only,
+/// `HL_TESTNET_PRIVKEY`. A run started with the key in its environment and
+/// the account left on Real would otherwise trade real funds with nobody
+/// having typed a key; on mainnet a blank password fails instead.
+fn choose_key(typed: Option<&str>, mainnet: bool, from_env: Option<String>) -> Result<String, String> {
+    match typed {
+        Some(k) if !k.is_empty() => Ok(k.to_string()),
+        _ if mainnet => Err("no password supplied; mainnet needs the key in the Password field".to_string()),
+        _ => from_env
+            .filter(|k| !k.is_empty())
+            .ok_or_else(|| "no password supplied and HL_TESTNET_PRIVKEY is not set".to_string()),
+    }
+}
+
+#[cfg(test)]
+mod key_tests {
+    use super::choose_key;
+
+    #[test]
+    fn a_typed_key_is_used_on_either_network() {
+        assert_eq!(choose_key(Some("typed"), true, Some("env".into())).unwrap(), "typed");
+        assert_eq!(choose_key(Some("typed"), false, Some("env".into())).unwrap(), "typed");
+    }
+
+    #[test]
+    fn the_environment_key_is_used_on_testnet_only() {
+        assert_eq!(choose_key(None, false, Some("env".into())).unwrap(), "env");
+        assert_eq!(choose_key(Some(""), false, Some("env".into())).unwrap(), "env");
+        let refused = choose_key(None, true, Some("env".into())).unwrap_err();
+        assert!(refused.contains("mainnet"), "{refused}");
+        assert!(choose_key(Some(""), true, Some("env".into())).is_err());
+    }
+
+    #[test]
+    fn no_key_at_all_is_an_error() {
+        assert!(choose_key(None, false, None).is_err());
+        assert!(choose_key(None, false, Some(String::new())).is_err());
+    }
 }
 
 /// `Amount` is a plain C `int`, so it can't hold a fraction of a base-asset
